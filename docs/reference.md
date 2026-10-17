@@ -187,6 +187,16 @@ an `apn` of its own (a PIN only, say) dials the interface's APN with the
 interface's login. Without `init_apn`, the same APN and login also go into the
 modem's LTE attach profile.
 
+**A network that refuses IPv6** on an `ipv4v6` connection — internal call-end
+210 "PDN IPv6 call disallowed" or 3GPP cause 50 "PDP type IPv4 only allowed"
+(QMI) — leaves the session on IPv4, and wwand logs once per context which
+option ends the request: `pdp_type 'ipv4'` on the interface, or in the
+`wwand_sim` section when only that card is affected. It does not change the
+setting by itself: the IP family is the operator's choice, and a SIM swap or a
+carrier that adds IPv6 later would otherwise inherit a decision made for this
+one. Set it when a modem misbehaves on the refusal (an RG520N-EB resets itself
+on the teardown of the refused IPv6 client, ddimension/wwand#53).
+
 How the sections relate (all in `/etc/config/network`):
 
 ```
@@ -539,6 +549,10 @@ config wwand_modem 'm0'
 	option stats_interval '60'       # telemetry period in seconds (0 = off)
 	option delay '0'                 # seconds to wait before the first init
 	option failreboot '100'          # attempts before the final reboot rung (0 = never reboot)
+	option recovery_steps '8 16 24'  # attempts at which the ladder cycles the radio, resets the
+	                                 #   modem, pulses the reset line / repowers. 1-3 rising
+	                                 #   whole numbers; the first ones replace the defaults in
+	                                 #   order ('2' = radio cycle at 2, the rest unchanged)
 	option unarmed_reset_after '300' # s: pulse THIS modem's reset_gpio once if it never answered (0 = never)
 	option card_hold '2100'          # s: after the card's own IPA (SGP.32 IPAe) changed the
 	                                 #    subscription, no modem reset / power-cycle / reboot
@@ -1647,7 +1661,7 @@ every method to it.
 | `modem_cells` | `modem` | registration + `registration_detail` + signal + decoded cells + `dsd` + `ca` + `temperature` (also on `status`, which is the canonical place — same field, kept here for compatibility) |
 | `modem_location` | `modem` | last GNSS fix, short form — a view over the `modem_gps` reader, whichever source feeds it (needs `option gnss` and `wwand-gps`) |
 | `modem_at` | `modem`, `command`, `timeout?` | run an AT command on the modem's AT port |
-| `modem_get_settings` / `modem_set_settings` | `modem`, `settings?` | NAS system-selection prefs (modes/bands) — the settings editor. Sets are **idempotent**: values the modem already carries are dropped; nothing left → `unchanged: true`, no NV write, no radio disturbance. On a Fibocom FM350/FM150 (NCM) the same calls speak `+GTACT` instead: the get adds `settable` (the keys a set may carry — band lists only, none on a tuple bands cannot be written for), `supported` (the module's own band catalogue), `nr_bands_shared: true` and `persistent: false`; a set refuses any other key, and an accepted band edit is also written to the modem's `band_*` options (see *Band allow-lists*) |
+| `modem_get_settings` / `modem_set_settings` | `modem`, `settings?` | NAS system-selection prefs (modes/bands) — the settings editor. Sets are **idempotent**: values the modem already carries are dropped; nothing left → `unchanged: true`, no NV write, no radio disturbance. On QMI and MBIM (passthrough) the get adds `band_caps: { lte, nr5g }`, the bands the modem supports (DMS Get Band Capabilities) — what LuCI's *Reset to defaults* sends instead of a blanket 1–63 / 1–79. A set the firmware refuses because of its band keys is sent once more without them: the result then carries `partial: true` and `refused` (`lte_bands`, `nr5g_sa_bands`, …) next to `applied`. On a Fibocom FM350/FM150 (NCM) the same calls speak `+GTACT` instead: the get adds `settable` (the keys a set may carry — band lists only, none on a tuple bands cannot be written for), `supported` (the module's own band catalogue), `nr_bands_shared: true` and `persistent: false`; a set refuses any other key, and an accepted band edit is also written to the modem's `band_*` options (see *Band allow-lists*) |
 | `modem_scan` / `modem_scan_start` / `modem_scan_status` | `modem` | visible-operator scan (sync, or async start+poll — a scan takes up to ~90 s) |
 | `modem_set_network_selection` | `modem`, `mode`, `mcc?`, `mnc?` | `auto` or `manual` PLMN selection (QMI NAS / MBIM passthrough / AT+COPS). Idempotent (`unchanged: true` when the modem already runs the requested selection); on deferred-apply models the result carries `deferred: true` + `apply: 'modem_reset'` |
 | `modem_reset` | `modem` | generic admin modem reset — the apply step for `deferred` results (write ACL). Order: the backend soft reset FIRST (QMI: DMS offline→reset, MBIM: passthrough-DMS or `AT+CFUN=1,1`, NCM: `AT+CFUN=1,1`) — it lets the modem shut down cleanly, where a pulse of the reset line cuts it mid-write and can corrupt its file system. The dedicated reset GPIO (per-modem `reset_gpio`, or the board default when only one modem is managed) is the fallback: pulsed at once when the soft reset is refused or there is none, and after `reset_fallback` seconds (default 30) when the modem acknowledged but never dropped off the bus. The result then carries `fallback_gpio` and `fallback_in`. When the QMI side or the MBIM passthrough is what hangs — no DMS client, or the request times out — QMI and MBIM reset over AT instead (`AT+CFUN=1,1`, opening the AT port for the one write if it is not open yet); the result then carries `via: 'at'`. The recovery ladder's modem-reset rung takes the same way. Result reports `action: 'gpio'\|'backend'`. The recovery ladder's own hardware rung (`modem_repower` below) is unchanged: it is reached because the soft path already failed. The modem re-enumerates and every `auto` interface comes back up on its own |
@@ -1761,13 +1775,28 @@ APN** — while the ES10 APDUs travel over wwand's channel (the daemon bridges
 lpac's stdio APDU protocol inline). AT-only modems download internally instead
 (Quectel `AT+QESIM`).
 
-The **APDU channel** is chosen per modem by `backend.choose`, in order:
-**QMI UIM logical channel** (native, or tunnelled over the QMI-over-MBIM
-passthrough) → **native MBIM MS UICC Low Level Access** (`OPEN_CHANNEL` /
-`APDU` / `CLOSE_CHANNEL`, so eSIM works on an MBIM modem even without an AT port)
-→ **AT** (`CCHO`/`CGLA`/`CCHC`, for firmwares that report the QMI channel as
-`NOT_SUPPORTED`). The same `_apdu_be` choice serves both the raw `modem_apdu`
-channel and the ES10c eSIM path.
+The **APDU channel** is chosen per modem by `backend.choose`, in order
+(`sim.uc apdu_backend`): **native MBIM MS UICC Low Level Access**
+(`OPEN_CHANNEL` / `APDU` / `CLOSE_CHANNEL`, so eSIM works on an MBIM modem even
+without an AT port) → **QMI UIM logical channel** (native, or tunnelled over the
+QMI-over-MBIM passthrough) → **AT** (`CCHO`/`CGLA`/`CCHC`, for firmwares that
+report the QMI channel as `NOT_SUPPORTED`). The same `_apdu_be` choice serves
+both the raw `modem_apdu` channel and the ES10c eSIM path. Discovering it opens
+the ISD-R; on a plain SIM every backend refuses that, which is an answer and not
+counted as a protocol error.
+
+On MBIM, an `OPEN_CHANNEL` is checked against what the Microsoft extension
+defines: `Channel 0` or a SELECT status other than `90 00` / `91 XX` is a
+failure, and a failed open names its cause (`select_failed`,
+`no_logical_channels`) with the card's SW1 SW2. wwand opens its channels in a
+channel group of its own (`0x7777`; lpac uses 1) and, before the first open of
+a modem run, closes everything left in that group — channels a crashed run
+left open would otherwise stay taken until the card resets. An eUICC that
+reports **no profile enabled** (MBIM ready state 7) stops the modem at the SIM
+step (`sim_block` reason `no_esim_profile`) instead of letting the recovery
+ladder reset it; once a profile is enabled the chain resumes on its own (the
+state is polled every 10 s, since that indication is not installed before
+registration).
 
 All operations go through `modem_esim { modem, op, slot?, … }` (`slot` defaults
 to 1):
@@ -1895,8 +1924,15 @@ built-in profile.
 
 The recovery ladder escalates on consecutive failed connection attempts:
 op-mode cycle (8) → modem reset (16) → board repower / reset-GPIO pulse (24) →
-system reboot (> `failreboot`, default 100). The three **hardware** rungs fire
-on their thresholds **independent of `failreboot`**; `failreboot 0` disables
+system reboot (> `failreboot`, default 100). The three hardware thresholds are
+per modem: `option recovery_steps '2 6 12'` (a value that does not rise is
+reported and the defaults kept). An earlier radio cycle is the useful one after
+a registration reject such as EMM #7: the spec lets the modem attach again only
+after a switch-off (TS 24.301 §5.5.1.2.6), and with the 240 s registration
+timeout the default 8 is half an hour (ddimension/wwand#52). The three **hardware** rungs fire
+on their thresholds **independent of `failreboot`** — but a `failreboot` below a
+threshold reboots before that rung is reached (when both fall due on the same
+attempt, the hardware rung goes first); `failreboot 0` disables
 **only** the final reboot — the hardware recovery still runs and the ladder then
 keeps retrying forever, so a headless box stays up for logging/debugging.
 `proto_error_limit` (default 25) is a separate ceiling on protocol-level errors,

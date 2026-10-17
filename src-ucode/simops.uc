@@ -100,6 +100,15 @@ export function install(self, o)
 		if (!m)
 			return false;
 
+		// another CARD, not another profile on the same one: what its ISD-R
+		// says has to be asked again (daemon.uc probe_euicc keeps the answer
+		// per modem, since a profile switch does not change the chip)
+		let ent = self.modems[ref];
+
+		ent._euicc_st = null;
+		ent._euicc_for = null;
+		ent.euicc = null;
+
 		// a different slot may hold a different eUICC — drop the cached
 		// eSIM/APDU backends so they are re-probed, and clear the
 		// once-per-object refresh guard + the stale surface data
@@ -118,7 +127,7 @@ export function install(self, o)
 		// nothing on either path ever clears them (evidence:
 		// ddimension/wwand#39, NR7101).
 		//
-		// modem.uc:1617-1622 already states the rule — card-side
+		// modem.uc:1626-1631 already states the rule — card-side
 		// diagnostics belong to the card we were talking to — and acts on
 		// it during teardown. This path is the other place a card changes
 		// underneath us, and it did not.
@@ -156,7 +165,7 @@ export function install(self, o)
 		// belongs to this module, not to the modem, so it outlives the
 		// teardown and would talk to a client that is mid-initialisation.
 		// `_gen` is the counter both backends already bump on teardown
-		// (modem.uc:1569, modem_mbim.uc:2592); NCM has none and degrades to
+		// (modem.uc:1578, modem_mbim.uc:2775); NCM has none and degrades to
 		// the identity check, which is the case its reset already answers.
 		let gen = m._gen;
 		// ...and a card change of its own: a remote SIM that comes and goes
@@ -228,6 +237,38 @@ export function install(self, o)
 			}
 
 			self.card_changed(ref, sprintf('SIM slot %d', physical));
+
+			// THE SWITCH KNOWS WHICH SLOT IS ACTIVE NOW, so say it. card_changed
+			// forgets the old one (it serves re-inits and plugin swaps too,
+			// where the slot is not known), and the slot status list is read
+			// once per registration — left as it was, it still showed the slot
+			// switched away from as active. The APDU layer maps the physical
+			// slot to QMI's logical one by exactly these two (sim.uc uim_slot):
+			// with the eUICC switched in, the eSIM page addressed "slot 2" and
+			// QMI refused it (NOT_SUPPORTED) until a restart re-read the list
+			// (HW-seen on 245, 2026-10-15).
+			let m = entry.modem;
+
+			m.active_slot = +physical;
+
+			// Two rows change, no more: the target is now logical slot 1 —
+			// what switch_slot asked for (SWITCH_SLOT { logical: 1 }), so the
+			// number the list held for it while inactive is not to be trusted
+			// — and the slot that held logical 1 gave it up. Another executor's
+			// active slot (DSDA/DSDS) is untouched. A list that carries no
+			// logical numbers (AT/NCM) only gets its active flags.
+			let qmi_rows = length(filter(m.slots ?? [], (sl) => sl.logical_slot != null)) > 0;
+
+			for (let sl in (m.slots ?? [])) {
+				if (+sl.physical == +physical) {
+					sl.active = true;
+
+					if (qmi_rows)
+						sl.logical_slot = 1;
+				}
+				else if (sl.active && (!qmi_rows || +sl.logical_slot == 1))
+					sl.active = false;
+			}
 
 			log('notice', sprintf('modem %s: switched to SIM slot %d', ref, physical));
 			cb(null, { slot: physical });

@@ -115,6 +115,7 @@ export function create(opts)
 	// (opts.v6state, carried via prev), NOT in `self`, so it SURVIVES the
 	// context rebuild a modem crash triggers. { refused?: bool, fails?: int }
 	let v6state = opts.v6state ?? {};
+	let v6_hint_given = false;   // pdp_type hint on an IPv6 refusal, once (activate)
 	let log = deps.log ?? ((level, msg) => warn(sprintf('%s: interface %s: %s\n', level, self.name, msg)));
 
 	// log an assigned family IP config at 'notice' only the FIRST time (at
@@ -857,7 +858,7 @@ export function create(opts)
 						// here (client.uc:176 — no `no_recovery` on the dial, and
 						// there must not be: a dial that genuinely fails has to
 						// climb). That is deliberate and harmless: the very next
-						// successful request zeroes it (recovery.uc:462-463), and
+						// successful request zeroes it (recovery.uc:505-506), and
 						// the same is already true of the NO_EFFECT that
 						// qmi_backend.set_opmode normalises.
 						// (a family is registered with pdh null BEFORE the dial,
@@ -1138,6 +1139,19 @@ export function create(opts)
 							cdesc?.text ? sprintf('%s (%s%s) ', cdesc.text,
 								cdesc.type_name ? cdesc.type_name + ' ' : '', cdesc.code) : '',
 							err));
+
+						// the network said "no IPv6" outright: name the option
+						// that stops asking. Once per context — the warning
+						// above repeats on every connect anyway. NOT applied
+						// automatically: pdp_type is the operator's word, and a
+						// SIM swap or a carrier that adds IPv6 later would
+						// inherit a decision made for this one (ddimension/wwand#53).
+						if (family == 6 && !v6_hint_given && callend.ipv6_refused(err?.verbose)) {
+							v6_hint_given = true;
+							log('notice', sprintf('the network refuses IPv6 here (%s) — if that is permanent, set option pdp_type \'ipv4\' on this interface, or in the SIM\'s wwand_sim section if only this card is affected',
+								cdesc?.text ?? 'refused'));
+						}
+
 						return next();
 					}
 

@@ -73,6 +73,69 @@ ret_sent = [];
 mc.telemetry_at(ret_modem).send('AT+CSQ', () => null);
 eq(ret_sent, [ 'AT+CSQ' ], 'retire: other commands keep being sent');
 
+// --- a command that never answers, on a port that does (ddimension/wwand#56) --
+// An RG520N-EB behind an MHI DUN bridge echoed AT+QENG="servingcell" and never
+// replied, while AT+CSQ answered on the same port: a timeout, every tick,
+// forever. A timeout counts only when the port answered something else since
+// the command last went silent; five of those retire it.
+{
+	let sent = [];
+	let m = {
+		_at_log: (l, msg) => null,
+		at_telemetry: { send: (cmd, cb) => {
+			push(sent, cmd);
+			(cmd == 'AT+QENG="servingcell"') ? cb({ error: 'timeout' }, { lines: [] })
+				: cb(null, { lines: [ '+CSQ: 20,99', 'OK' ] });
+		} },
+	};
+
+	for (let i = 0; i < 8; i++) {
+		mc.telemetry_at(m).send('AT+CSQ', () => null);
+		mc.telemetry_at(m).send('AT+QENG="servingcell"', () => null);
+	}
+
+	eq(length(filter(sent, (c) => c == 'AT+QENG="servingcell"')), 5,
+		'silent: a command that never answers while the port does is asked five times, then not again');
+	eq(length(filter(sent, (c) => c == 'AT+CSQ')), 8, 'silent: the answering command keeps going');
+	let why = null;
+	mc.telemetry_at(m).send('AT+QENG="servingcell"', (e) => { why = e?.detail; });
+	eq(why, 'retired after repeated timeouts on a port that answers', 'silent: the retired command says why');
+
+	// COUNTERPROOF: a port that answers NOTHING retires nothing — that is the
+	// port, not the command
+	let dead_sent = [];
+	let dead = {
+		_at_log: (l, msg) => null,
+		at_telemetry: { send: (cmd, cb) => { push(dead_sent, cmd); cb({ error: 'timeout' }, { lines: [] }); } },
+	};
+
+	for (let i = 0; i < 8; i++) {
+		mc.telemetry_at(dead).send('AT+CSQ', () => null);
+		mc.telemetry_at(dead).send('AT+QENG="servingcell"', () => null);
+	}
+
+	eq(length(dead_sent), 16, 'silent: a port that answers nothing retires nothing');
+
+	// ...and a slow command that answers now and then is never retired
+	let slow_sent = [], k = 0;
+	let slow = {
+		_at_log: (l, msg) => null,
+		at_telemetry: { send: (cmd, cb) => {
+			push(slow_sent, cmd);
+			(cmd == 'AT+QCAINFO' && (k++ % 3) != 2) ? cb({ error: 'timeout' }, { lines: [] })
+				: cb(null, { lines: [ 'OK' ] });
+		} },
+	};
+
+	for (let i = 0; i < 12; i++) {
+		mc.telemetry_at(slow).send('AT+CSQ', () => null);
+		mc.telemetry_at(slow).send('AT+QCAINFO', () => null);
+	}
+
+	eq(length(filter(slow_sent, (c) => c == 'AT+QCAINFO')), 12,
+		'silent: an answer now and then resets the count — never retired');
+}
+
 // COUNTERPROOF 1: a bare ERROR that is not consecutive never retires anything.
 // This is the ddimension/wwand#12 shape — AT^CHIPTEMP was latched off on its
 // first error and the modem reported no temperature again for the whole
@@ -1310,6 +1373,51 @@ eq(length(uc_clock), 1, 'urc_common: unrelated URCs are left alone');
 		'mute walk: every port is probed once, in order');
 	eq(m.at_tty, '/dev/ttyUSB2', 'mute walk: settles on the port that answers');
 	ok(m.at != null, 'mute walk: a control engine is left behind');
+})();
+
+// --- a port that will not OPEN does not end the search either --------------
+// T99W175 in USB mode (ddimension/wwand#52): ttyUSB0 mute, ttyUSB1 listed in
+// sysfs but "No such file or directory" on open, AT on ttyUSB2. The open
+// failure used to jump straight to the MBIM pipe.
+(function () {
+	let opened = [];
+	let mk = (tty) => {
+		let t = { close: () => null, drain: () => null };
+
+		t.write = (d) => {
+			if (t.data_cb && match(d ?? '', /^AT\r?$/) && tty == '/dev/ttyUSB2')
+				t.data_cb("\r\nOK\r\n");
+
+			return true;
+		};
+
+		t.on_data = (cb) => { t.data_cb = cb; };
+		return t;
+	};
+	let fx = fake_fx('dead:beef', [ { ifn: 2, tty: 'ttyUSB0' },
+	                                { ifn: 3, tty: 'ttyUSB1' },
+	                                { ifn: 4, tty: 'ttyUSB2' } ]);
+	let m = { device: 'usb0', config: {}, info: {} };
+	let reached = false;
+
+	mc.open_at(m, {
+		at_opts: {
+			fx: fx,
+			open_transport: (tty) => { push(opened, tty); return (tty == '/dev/ttyUSB1') ? null : mk(tty); },
+			probe_timeout: 20,
+		},
+		log: (level, msg) => null,
+		set_drain_timer: () => null,
+		next: () => { reached = true; uloop.end(); },
+	});
+
+	uloop.timer(3000, () => uloop.end());
+	uloop.run();
+
+	ok(reached, 'unopenable walk: open_at completes');
+	eq(opened, [ '/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyUSB2' ],
+		'unopenable walk: the port that will not open is skipped, not the end');
+	eq(m.at_tty, '/dev/ttyUSB2', 'unopenable walk: settles on the port that answers');
 })();
 
 // --- normalise_qmi_signal: the not-available sentinels never reach the bus ----

@@ -814,6 +814,7 @@ export function make_recovery(self, opts, log, proto)
 		// persisted with the counters: a protocol change invalidates `proven`
 		protocol: opts.protocol,
 		failreboot: (opts.config ?? {}).failreboot,
+		recovery_steps: (opts.config ?? {}).recovery_steps,
 		proto_error_limit: (opts.config ?? {}).proto_error_limit,
 		unarmed_reset_after: (opts.config ?? {}).unarmed_reset_after,
 		now: opts.recovery?.now,
@@ -1028,6 +1029,12 @@ export function watch_driver(o)
 // success in between is firmware, not weather.
 const AT_RETIRE_AFTER = 3;
 
+// How many timeouts of ONE command retire it — counted only while the port
+// answers other commands in between (telemetry_at). More than the ERROR count:
+// a timeout costs a whole probe wait each time, but it is also the weaker
+// evidence, so it takes longer to convince.
+const AT_RETIRE_SILENT_AFTER = 5;
+
 // Has this AT channel given up on every one of these commands? The question a
 // telemetry family asks about its OWN signal source before deciding whether the
 // serving-cell read is authoritative: a modem that refuses AT+QSINR? has no
@@ -1057,11 +1064,22 @@ export function at_retired(self, ...cmds)
 // module, and a model table would never be finished. So ask the modem, once,
 // and believe its answer.
 //
-// Only a BARE `ERROR` retires a command. `+CME ERROR: <n>` is a runtime
-// condition (SIM not ready, no network) that says nothing about whether the
-// firmware knows the command, and a timeout means the port is wedged, not that
-// the command is unknown — retiring on either would silence telemetry that
-// works. atcmd already separates the three (atcmd.uc:823 vs :801 vs :749).
+// A BARE `ERROR` retires a command. `+CME ERROR: <n>` never does: it is a
+// runtime condition (SIM not ready, no network) that says nothing about whether
+// the firmware knows the command. atcmd already separates the three
+// (atcmd.uc:830 vs :801 vs :749).
+//
+// A TIMEOUT retires one only when the PORT IS PROVABLY ALIVE. On its own a
+// timeout means the port is wedged or the modem busy — then every command goes
+// silent, and retiring on that would silence telemetry that works. But a
+// command that times out while the same port answers the others is a command
+// this firmware path never answers: an RG520N-EB behind an MHI DUN bridge
+// echoed AT+QENG="servingcell" and never replied, 0 of 40+ per boot, while
+// AT+CSQ and AT+QCAINFO answered on the same port (ddimension/wwand#56). So
+// a timeout counts only if some OTHER command got an answer since this one
+// last timed out (`_at_alive`, bumped on every answer), and
+// AT_RETIRE_SILENT_AFTER of those retire it. A port that answers nothing
+// counts nothing.
 //
 // The memory is cleared with the AT channel (close_at), so a re-open after a
 // protocol switch or a re-enumeration asks again from scratch.
@@ -1080,9 +1098,41 @@ export function telemetry_at(self)
 		// o: passed through to atcmd.send (timeout, probe)
 		send: (cmd, cb, o) => {
 			if (self._at_retired?.[cmd])
-				return cb ? cb({ error: 'unsupported', detail: 'retired after repeated ERROR' }, null) : null;
+				return cb ? cb({ error: 'unsupported',
+				                 detail: sprintf('retired after %s', self._at_retired[cmd] === true ? 'repeated ERROR' : self._at_retired[cmd]) }, null) : null;
 
 			at.send(cmd, (err, res) => {
+				let silent = (err?.error == 'timeout');
+
+				// the port answered (anything but silence or a closed port)
+				if (!silent && err?.error != 'closed')
+					self._at_alive = (self._at_alive ?? 0) + 1;
+
+				if (silent) {
+					let seen = self._at_silent?.[cmd];
+
+					self._at_silent ??= {};
+
+					// counted only when the port answered something else
+					// since this command last went silent
+					if (seen == null || seen.alive != (self._at_alive ?? 0)) {
+						let n = (seen?.n ?? 0) + 1;
+
+						self._at_silent[cmd] = { n: n, alive: self._at_alive ?? 0 };
+
+						if (n >= AT_RETIRE_SILENT_AFTER) {
+							self._at_retired ??= {};
+							// the cause, for the error a caller gets from now on
+							self._at_retired[cmd] = 'repeated timeouts on a port that answers';
+							self._at_log?.('notice', sprintf('%s went unanswered %d times while the port answered everything else — not asking again (re-probed on the next modem init)',
+								cmd, AT_RETIRE_SILENT_AFTER));
+						}
+					}
+				}
+				else if (self._at_silent)
+					// an answer of any kind ends the streak, as for ERROR
+					delete self._at_silent[cmd];
+
 				if (err?.error == 'ERROR') {
 					self._at_errors ??= {};
 					self._at_errors[cmd] = (self._at_errors[cmd] ?? 0) + 1;
@@ -1473,6 +1523,8 @@ export function close_at(self)
 	// command does not exist" would silence telemetry that now works.
 	self._at_retired = null;
 	self._at_errors = null;
+	self._at_silent = null;
+	self._at_alive = 0;
 };
 
 // The init commands every AT channel runs once it answers: model quirks,
@@ -1807,10 +1859,21 @@ open_at_tty = function(self, o, fxi, log, ch, tried)
 
 	if (!tr) {
 		// A port that will not open is as good as absent — another process may
-		// hold it, or it may have vanished between discovery and here. Try the
-		// MBIM pipe rather than giving up on AT entirely.
-		log('warn', sprintf('cannot open AT port %s', tty));
-		return open_at_over_mbim(self, o, fxi, log);
+		// hold it, or it may have vanished between discovery and here. It is
+		// skipped like a mute one and the search goes on: going straight to the
+		// MBIM pipe left a working tty further down untried — a T99W175 in USB
+		// mode offered ttyUSB0 (mute) and ttyUSB1 (would not open) and answered
+		// on ttyUSB2 (evidence: ddimension/wwand#52, 2026-10-11).
+		log('warn', sprintf('cannot open AT port %s — trying the next channel', tty));
+		push(tried, tty);
+
+		let nch = atcmd.find_at_channels(fxi, self.device, self.config.tty,
+		                                 o.base_override, tried);
+
+		if (nch.primary)
+			return open_at_tty(self, o, fxi, log, nch, tried);
+
+		return open_at_over_wdm(self, o, fxi, log, () => open_at_over_mbim(self, o, fxi, log));
 	}
 
 	// on_urc is LATE-BOUND on purpose: a backend may install or wrap its handler

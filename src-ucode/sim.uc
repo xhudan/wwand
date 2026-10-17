@@ -93,7 +93,7 @@ export function pin_block_reason(retries, force)
 
 // A CARD POLL MUST NOT OUTLIVE ITS SESSION. The retries below re-enter
 // unlock_uim/unlock_dms, which re-read modem.uim / modem.dms at entry — and
-// teardown nulls those (modem.uc:1587). An anonymous timer firing after an
+// teardown nulls those (modem.uc:1596). An anonymous timer firing after an
 // unplug or a config reload inside the up-to-10 s poll window therefore
 // dereferenced null, and a throw inside a uloop callback ends the program: the
 // next timer never runs and uloop.run() does not return (measured 2026-09-19).
@@ -1415,6 +1415,31 @@ function at_apdu_open(modem, aid_hex, cb, opts)
 	}, { timeout: 15000, probe: opts?.probe });
 }
 
+// The card (or the modem on its behalf) ANSWERED the open with a no: the AT
+// command came back ERROR / +CME ERROR, QMI sent an error response, MBIM
+// named a refused SELECT. As against a timeout, a closed port or no APDU
+// transport at all, which say nothing about the card. A plain SIM refuses the
+// ISD-R the same way on every try, so this is a final answer
+// (ddimension/wwand#57: an EG12-EA logged the refusal at each retry).
+//
+// A QMI error is an answer EXCEPT the ones that describe the moment, not the
+// card: NO_MEMORY 2, INTERNAL 3, ABORTED 4, DEVICE_NOT_READY 52,
+// NETWORK_NOT_READY 53, INSUFFICIENT_RESOURCES 68, INCOMPATIBLE_STATE 90
+// (libqmi 1.38 qmi-errors.h:232-317) — asked again later, those can come out
+// differently.
+const QMI_TRANSIENT = [ 2, 3, 4, 52, 53, 68, 90 ];
+
+function refused_answer(err)
+{
+	let e = err?.error;
+
+	if (e == 'qmi')
+		return index(QMI_TRANSIENT, +(err?.code ?? -1)) < 0;
+
+	return e == 'ERROR' || e == 'cme' || e == 'cms' ||
+	       e == 'uicc_select' || (e == 'mbim' && err?.reason != null);
+}
+
 function at_apdu_send(modem, channel, apdu_hex, cb)
 {
 	let h = uc(apdu_hex);
@@ -1447,6 +1472,43 @@ function at_apdu_close(modem, channel, cb)
 // passthrough) -> AT CCHO/CGLA/CCHC. cb('mbim' | 'qmi' | 'at' | null)
 export const ISDR_AID = 'a0000005591010ffffffff8900000100';
 
+// QMI UIM LOGICAL CHANNELS ADDRESS THE LOGICAL SLOT, the APDU API a PHYSICAL
+// one. On a single-executor modem the active card is logical slot 1 whatever
+// physical slot holds it: with the eUICC in physical slot 2 active, an RG650E
+// opens the ISD-R on slot 1 and answers NOT_SUPPORTED (94) on slot 2
+// (HW-observed on 245, 2026-10-15) — the eSIM page asked for "slot 2" and got
+// nothing. The slot status list (modem.slots, simops modem_sim_slots) gives
+// the logical number of a slot it says is ACTIVE — on a multi-executor modem
+// that can be 2 for another active slot. Without such a row, the active slot
+// as last switched (modem.active_slot) is logical 1: the list is read once per
+// registration, and before the switch updated it (simops modem_sim_switch_slot)
+// it still showed slot 2 inactive after the switch to it. Any other slot passes
+// through unchanged: a card that is not active is not reachable, and the
+// modem says so.
+function uim_slot(modem, slot)
+{
+	let n = +slot;
+	let listed = null;
+
+	for (let s in (modem?.slots ?? []))
+		if (+s.physical == n && s.active && s.logical_slot != null)
+			listed = +s.logical_slot;
+
+	// a mapping the list states for an ACTIVE slot wins — on a modem with
+	// several executors another active physical slot is not logical 1
+	if (listed != null)
+		return listed;
+
+	return (modem?.active_slot != null && n == +modem.active_slot) ? 1 : n;
+}
+
+// A DISCOVERY OPEN IS NOT A CHANNEL FAULT. Opening the ISD-R is how the
+// transport and the eUICC are found, and on a plain SIM every backend refuses
+// it (MBIM UICC SelectFailed, QMI OPEN_LOGICAL_CHANNEL error). Counted toward
+// the recovery ladder's protocol-error ceiling, a card without an eUICC drew
+// errors at every start (evidence: ddimension/wwand#51, RM520N, 2026-10-14).
+const NOT_A_FAULT = { no_recovery: true };
+
 function apdu_backend(modem, slot, cb)
 {
 	backend.choose(modem, '_apdu_be', [
@@ -1462,7 +1524,7 @@ function apdu_backend(modem, slot, cb)
 					return ok(true);
 				}
 				ok(false);
-			});
+			}, NOT_A_FAULT);
 		} },
 		// QMI logical channel: probe with the ISD-R AID; NOT_SUPPORTED -> next.
 		// On an MBIM modem modem.uim is null until a UIM client is allocated over
@@ -1474,15 +1536,15 @@ function apdu_backend(modem, slot, cb)
 					return ok(false);
 
 				modem.uim.request('OPEN_LOGICAL_CHANNEL', {
-					slot: slot, aid: hex_to_arr(ISDR_AID),
+					slot: uim_slot(modem, slot), aid: hex_to_arr(ISDR_AID),
 				}, (err, data) => {
 					if (!err && data.channel_id != null) {
 						modem.uim.request('LOGICAL_CHANNEL',
-							{ slot: slot, channel_id: data.channel_id, terminate: 1 }, () => {});
+							{ slot: uim_slot(modem, slot), channel_id: data.channel_id, terminate: 1 }, () => {});
 						return ok(true);
 					}
 					ok(false);
-				});
+				}, NOT_A_FAULT);
 			};
 
 			if (!modem.uim && modem._ensure_uim)
@@ -1612,7 +1674,8 @@ export function apdu_open(modem, slot, aid_hex, cb, opts)
 
 		if (be == 'mbim')
 			return modem.mbim_uicc.open(aid_hex, (err, d) =>
-				cb(err, d ? { channel: d.channel, select_response: d.select_response } : null));
+				cb(err, d ? { channel: d.channel, select_response: d.select_response } : null),
+				opts?.probe ? NOT_A_FAULT : null);
 
 		if (be == 'at')
 			return at_apdu_open(modem, aid_hex, cb, opts);
@@ -1621,14 +1684,14 @@ export function apdu_open(modem, slot, aid_hex, cb, opts)
 			return cb({ error: 'no_apdu_channel' }, null);
 
 		modem.uim.request('OPEN_LOGICAL_CHANNEL', {
-			slot: slot, aid: hex_to_arr(aid_hex),
+			slot: uim_slot(modem, slot), aid: hex_to_arr(aid_hex),
 		}, (err, data) => {
 			if (err || data.channel_id == null)
 				return cb(err ?? { error: 'no_channel' }, null);
 
 			cb(null, { channel: data.channel_id,
 			           select_response: arr_to_hex(data.select_response) });
-		});
+		}, opts?.probe ? NOT_A_FAULT : null);
 	});
 };
 
@@ -1732,7 +1795,7 @@ export function apdu_send(modem, slot, channel, apdu_hex, cb)
 		return cb({ error: 'no_uim_client' }, null);
 
 	modem.uim.request('SEND_APDU', {
-		slot: slot, channel_id: channel, apdu: hex_to_arr(apdu_hex),
+		slot: uim_slot(modem, slot), channel_id: channel, apdu: hex_to_arr(apdu_hex),
 	}, (err, data) => {
 		if (err)
 			return cb(err, null);
@@ -1811,13 +1874,17 @@ export function apdu_close(modem, slot, channel, cb)
 		return cb({ error: 'no_uim_client' });
 
 	modem.uim.request('LOGICAL_CHANNEL', {
-		slot: slot, channel_id: channel, terminate: 1,
+		slot: uim_slot(modem, slot), channel_id: channel, terminate: 1,
 	}, (err) => cb(err ?? null));
 };
 
 // card_euicc_info(modem, cb): what the card's ISD-R says about it, and which
-// IPA is in charge. cb(info | null), null = no ISD-R reached (a plain SIM, no
-// APDU channel, an AT transport without the FCI) — unknown, not "no".
+// IPA is in charge. cb(info | null, final), null = no ISD-R reached (a plain
+// SIM, no APDU channel, an AT transport without the FCI). `final` says whether
+// asking again can change the answer: true when the card ANSWERED — it refused
+// the SELECT (refused_answer), or the channel opened — false when the
+// transport could not ask (a timeout, no channel yet). The daemon retries
+// only the second kind (probe_euicc).
 // info: { sgp32: bool, ipae_supported: bool, svn: '2.5.0' | null,
 //         ipa: 'ipae' | 'ipad' | null } — ipa only for an SGP.32 card.
 //
@@ -1834,11 +1901,11 @@ export function card_euicc_info(modem, cb)
 
 	apdu_open(modem, slot, ISDR_AID, (err, ch) => {
 		if (err || ch?.channel == null)
-			return cb(null);
+			return cb(null, refused_answer(err));
 
 		let fin = (v) => {
 			apdu_close(modem, slot, ch.channel, () => null);
-			cb(v);
+			cb(v, true);
 		};
 
 		let f = length(ch.select_response ?? '') ? fci_iot_info(ch.select_response) : null;

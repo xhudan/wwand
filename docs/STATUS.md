@@ -1377,6 +1377,66 @@ its own, i.e. adopt-first after a reattach on this modem.
 Still the old order: the init attach-profile radio cycle (no live session
 normally at that point).
 
+## Issue round 2026-10-13: AT port walk past an unopenable tty; MBIM settings refresh
+
+- **#52 (T99W175, USB mode):** the AT search ended at a tty that would not
+  open (`ttyUSB1`, "No such file or directory") and went straight to the
+  MBIM pipe, never trying `ttyUSB2`, where the modem answers. An unopenable
+  port is now skipped like a mute one (`modem_common.uc open_at_tty`); the
+  wdm/MBIM fallbacks follow only when no tty is left. Workaround on older
+  builds: `option tty '/dev/ttyUSB2'`.
+- **#51 (RM520N, MBIMEx 3.0):** `IP_CONFIGURATION` answered at connect,
+  Failure (status 2) to every periodic refresh, traffic fine — each refusal
+  counted as a protocol error and the next success reset it: a sawtooth in
+  collectd's proto_errors. The refresh is now `no_recovery`, logged once per
+  run of refusals, the settings kept, and sent after the statistics answer
+  instead of beside it (whether the overlap is what the modem refuses is
+  unproven — the order costs nothing).
+- **#51 follow-up:** the eUICC discovery on a plain SIM (MBIM UICC SelectFailed,
+  QMI OPEN_LOGICAL_CHANNEL) counted toward the protocol-error ceiling at every
+  start; the ISD-R discovery opens are `no_recovery` now (`sim.uc` NOT_A_FAULT).
+- **#52 follow-up:** T99W175 in USB mode (05c6:90d5) pinned in `atcmd.uc`
+  LOCAL_PORTS: if5 = AT (if0 DIAG, if4 has no bulk endpoints).
+- **#52 feature (asked for by the reporter, approved 2026-10-14):** `option
+  recovery_steps` on `wwand_modem` — the attempt counts of the radio cycle,
+  modem reset and hardware rung (default 8 16 24; 1-3 rising numbers, the
+  first ones replacing the defaults). `recovery.uc steps_from` / per-instance
+  RUNGS, `config.uc steps_opt` (refused with a warning, never half-applied),
+  status ladder (`recovery.rungs(failreboot, steps)`), LuCI modem option.
+- **HW 2026-10-15, eSIM:** 245 (RG650E, QMI): with the eUICC in physical slot 2
+  active, QMI logical channels need logical slot 1 — fixed (`sim.uc
+  uim_slot`, switch records the active slot). 3.93 (RM520N-GL): eSIM over QMI
+  and over **native MBIM UICC** (first HW proof: open/APDU/close, EID +
+  profiles), named open failure `select_failed`/SW 6A82 on a plain SIM; the
+  MBIM group close is refused (INVALID_LOGICAL_CHANNEL) by that firmware.
+- **PR #56 (xhudan) taken with a follow-up:** QMI-context AT+QENG goes through
+  telemetry_at (his commit). telemetry_at retired on ERROR only, and the case
+  was timeouts — so a timeout now counts when the port answered another
+  command since this one last went silent; 5 retire it (`modem_common.uc`
+  AT_RETIRE_SILENT_AFTER). A port that answers nothing retires nothing.
+- **Issue round 2026-10-15:** #55 (SG500M2-X, MBIM) — *Reset to defaults*
+  sent bands 1–63/1–79 with the RAT reset in one SET; the firmware refused the
+  bands (qmi 3) and with them the RAT reset, silently. Now DMS Get Band
+  Capabilities (`dms.uc`, `band_caps`) gives the real band list, and a refused
+  band set is re-sent without bands (`partial`, `refused`). #57 (EG12-EA) —
+  the eUICC probe stops at the first ANSWERED refusal (`sim.uc
+  refused_answer`; QMI transient codes excluded), retries only when the
+  transport could not ask; a card change re-asks. #52 — MBIM identity asks
+  AT+GMI first (T99W175 answers AT+CGMI without OK).
+- **MS UICC text pass (2026-10-14):** MBIM ready state 7 "no eSIM profile
+  enabled" stops at the SIM step (`no_esim_profile`, no ladder) and resumes by a
+  10 s ready-state poll (the indication handler only exists after
+  registration — so `sim_absent` on MBIM now resumes on card insertion too);
+  OPEN_CHANNEL failures named with SW1 SW2 (`mbim_client` `keep_info`); own
+  channel group 0x7777, swept once per modem run before the first open.
+  Not HW-verified (no eUICC-capable MBIM modem). Noted, not changed: lpac
+  sends APDUs as class type Inter-Industry, wwand as Extended (ETSI 102 221,
+  which GP STORE DATA CLA 80 belongs to); TERMINAL_CAPABILITY unused.
+- **PR #53 (closed):** automatic IPv6 suppression after refusals declined —
+  `pdp_type` is the operator's; instead a typed refusal (internal 210, 3GPP
+  50; `callend.uc ipv6_refused`) logs once per context which option ends it
+  (`context.uc`, the v6 degrade branch).
+
 ## Known open
 
 - **DONE (2026-09-21) — `pdp_type` is configurable per SIM.** `wwand_sim` now

@@ -266,7 +266,7 @@ export function vanish_action(entry, now, timing)
 // two statements now; the helper stays, as it costs nothing.
 function euicc_answer(fn, entry, m, st)
 {
-	return (info) => fn(entry, m, st, info);
+	return (info, final) => fn(entry, m, st, info, final);
 }
 
 export function create(opts)
@@ -480,7 +480,7 @@ export function create(opts)
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:939-942 warns "references
+	// produces no entry for it at all (config.uc:961-964 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -1339,19 +1339,22 @@ export function create(opts)
 	// mid-read go without its recovery hold. And an empty answer is not
 	// final — a plain SIM gives one, but so does a transport being rebuilt —
 	// so it is asked again, a minute apart, up to three times per modem
-	// object; a plain SIM then stops being asked.
+	// object — but only when the transport could not ask: a card that
+	// refused the ISD-R has answered, and is not asked again.
 	let EUICC_TRIES = 3, EUICC_RETRY_S = 60;
 
 	// What a finished read does. Reached through euicc_answer (module level,
 	// below the imports): see the note there.
-	let euicc_read = (entry, m, st, info) => {
+	let euicc_read = (entry, m, st, info, final) => {
 		st.busy = false;
 
 		if (entry.modem !== m || entry._euicc_st !== st)
 			return;
 
 		entry.euicc = info;
-		st.done = (info != null);
+		// a card that ANSWERED is not asked again, whatever it said — a plain
+		// SIM refuses the ISD-R the same way each time (sim.uc refused_answer)
+		st.done = (info != null) || !!final;
 		st.next_at = time() + EUICC_RETRY_S;
 
 		if (info?.sgp32)
@@ -1420,10 +1423,10 @@ export function create(opts)
 	//
 	//   - CONNECTED is sufficient but not necessary. An MBIM attempt aborted
 	//     while the modem was still answering sets `activated` from the late
-	//     reply (context_mbim.uc:344-348), so an IDLE context can be holding a
+	//     reply (context_mbim.uc:367-371), so an IDLE context can be holding a
 	//     session that only down() will tear down.
 	//   - ACTIVATING is not "no session yet" either: MBIM sets `activated`
-	//     before it queries the IP configuration (context_mbim.uc:359-360), NCM
+	//     before it queries the IP configuration (context_mbim.uc:382-383), NCM
 	//     before it reads its own (context_ncm.uc:742), and QMI can have
 	//     activated families while settings are still being fetched.
 	//
@@ -1458,7 +1461,7 @@ export function create(opts)
 	// whether anything started it.
 	//
 	// COMPARED HERE rather than trusted from the event. modem_mbim filters its
-	// own emit on a change (modem_mbim.uc:971-980) while the shared reapply
+	// own emit on a change (modem_mbim.uc:1014-1023) while the shared reapply
 	// tail emits on every re-read (modem_common.uc:643-649); one comparison, in
 	// the place that acts on it, cannot disagree with itself.
 	let modem_sim_refresh = (modem, data) => {
@@ -2564,7 +2567,7 @@ export function create(opts)
 		// entry.modem.stop() has just closed. One orphan per removal, and its
 		// late events can arm a spurious reconnect-hold on the rebuilt entry.
 		// `lost` is built for exactly this — it stops the monitor and destroys
-		// the family clients without attempting QMI cleanup (context.uc:1196).
+		// the family clients without attempting QMI cleanup (context.uc:1210).
 		for (let cname, centry in self.contexts) {
 			if (centry.cfg.modem == name && centry.ctx)
 				centry.ctx.modem_event('lost');
@@ -4366,15 +4369,22 @@ export function create(opts)
 
 			let fired = +(c.rung ?? 0);
 			let attempts = +(c.attempts ?? 0);
-			let table = recoverymod.rungs(entry.cfg?.failreboot ?? 100);
+			let table = recoverymod.rungs(entry.cfg?.failreboot ?? 100, entry.cfg?.recovery_steps);
 			let next = null;
 
-			for (let i = 0; i < length(table); i++)
-				if (i >= fired) {
-					next = { at: table[i].at, action: table[i].action,
-					         in: (table[i].at > attempts) ? (table[i].at - attempts) : 0 };
-					break;
-				}
+			// `fired` counts HARDWARE rungs only; the table is in firing order
+			// (recovery.rungs sorts the reboot in), so the next step is the
+			// first entry that is not a hardware rung already fired
+			let hw = 0;
+
+			for (let i = 0; i < length(table); i++) {
+				if (table[i].action != 'reboot' && hw++ < fired)
+					continue;
+
+				next = { at: table[i].at, action: table[i].action,
+				         in: (table[i].at > attempts) ? (table[i].at - attempts) : 0 };
+				break;
+			}
 
 			return {
 				attempts: attempts,

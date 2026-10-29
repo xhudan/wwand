@@ -659,7 +659,7 @@ export function create(opts)
 			// WHERE THE REBOOT WINDOW STARTS. Without this the gate below reads
 			// the ABSOLUTE count, and the count does not start climbing when the
 			// hardware rung fires — it climbs from the very first error. A
-			// channel that never answers sits at :319 returning 'retry' while n
+			// channel that never answers sits at :651 returning 'retry' while n
 			// runs far past limit*2; the first decoded reply (an error reply
 			// counts) arms proto_ok, the next error fires this repower, and the
 			// error AFTER that satisfies `n > limit*2` on the strength of
@@ -720,6 +720,20 @@ export function create(opts)
 			self.counters.proto_hw_base = 0;
 			self.persist();
 		}
+	};
+
+	// Would usb_repower() actually act on this modem? The zero-rx watchdog asks
+	// before it falls through to a modem reset (modem_common.trip_zero_rx): a
+	// board that CAN repower should, and only a board that cannot gets the
+	// reset. Prefer the assembler's mechanism-aware answer (opts.can_repower,
+	// which the daemon computes from the real reset_gpio / power_gpio); without
+	// one, mirror usb_repower()'s own reach below — a board repower callback
+	// exists (opts.repower) or nothing here does. NOT a bare usb_repower()==false:
+	// the daemon always hands a repower closure, even where it no-ops, so the
+	// closure's mere presence cannot distinguish "no mechanism" from "refused"
+	// (ddimension/wwand#59).
+	self.can_repower = function() {
+		return opts.can_repower ? opts.can_repower() : (opts.repower != null);
 	};
 
 	// hardware repower rung. Preferred: a board-provided callback (opts.repower)

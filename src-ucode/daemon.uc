@@ -28,7 +28,7 @@ import * as modem_common from 'wwand.modem_common';
 import * as logmod from 'wwand.log';
 
 // The agreed MS extension version as text. Both halves of the u16, the way
-// mbim_client's own open-time log line writes it (mbim_client.uc:203-205) —
+// mbim_client's own open-time log line writes it (mbim_client.uc:207-209) —
 // only x.0 generations are defined today, but reading the number the way its
 // owner does is cheaper than being right about that forever.
 function mbimex_text(v)
@@ -183,6 +183,34 @@ const QMI_SERVICE_UIM_REMOTE = sprintf('%d', 0x32);
 //   { supported: null, reason }    not known yet (services not read, the
 //                                  passthrough not set up)
 //   null                           no modem object
+// THE SWITCH DECIDES WHETHER IT IS LISTED AT ALL, on Quectel. The service is
+// registered only when an EFS item enables it, and that item is read at boot:
+// an RG502Q-EA and an EG06-E listed no UIM Remote with it at 00 and did after
+// 00 -> 01 and a modem reset (HW-observed, ZyXEL NR7101 / LTE3301-PLUS,
+// 2026-10-24). So "not listed" on a Quectel usually means "switched off", and
+// reporting it as "the modem offers no UIM Remote" sent people away from a
+// modem that only needed the switch. The daemon reads the item once per modem
+// object (uim_remote_switch_probe, from the status tick) and the reason below
+// names what it found. ERROR means the item does not exist — the firmware
+// default, off (the same answer an RG650E gave before it was first written).
+const UIMRMT_EFS = '/nv/item_files/modem/uim/remote/uim_remote_service_enable';
+
+function uim_remote_not_listed(m, what)
+{
+	let sw = m.uim_remote_switch;
+
+	if (sw == 'off' || sw == 'unset')
+		return { supported: false, switch: sw,
+		         reason: sprintf('UIM Remote is switched off in the modem firmware (%s %s); it is read at boot — switch it on (the remote-SIM tooling does) and reset the modem',
+		                         UIMRMT_EFS, (sw == 'off') ? '= 00' : 'not set') };
+
+	if (sw == 'on')
+		return { supported: false, switch: sw,
+		         reason: 'UIM Remote is switched on in the modem firmware but not listed yet — the switch is read at boot, so the modem needs a reset' };
+
+	return { supported: false, reason: what };
+}
+
 function remote_sim_support(protocol, m)
 {
 	if (!m)
@@ -194,14 +222,14 @@ function remote_sim_support(protocol, m)
 
 		return m.services[QMI_SERVICE_UIM_REMOTE]
 			? { supported: true, via: 'qmi' }
-			: { supported: false, reason: 'the modem offers no QMI UIM Remote service' };
+			: uim_remote_not_listed(m, 'the modem offers no QMI UIM Remote service');
 	}
 
 	if (protocol == 'mbim') {
 		if (type(m.pt?.services) == 'object')
 			return m.pt.services[QMI_SERVICE_UIM_REMOTE]
 				? { supported: true, via: 'mbim-passthrough' }
-				: { supported: false, reason: 'the QMI passthrough offers no UIM Remote service' };
+				: uim_remote_not_listed(m, 'the QMI passthrough offers no UIM Remote service');
 
 		if (m._pt_failed)
 			return { supported: false, reason: 'the modem has no QMI passthrough over MBIM' };
@@ -480,7 +508,7 @@ export function create(opts)
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:961-964 warns "references
+	// produces no entry for it at all (config.uc:1044-1047 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -1423,11 +1451,11 @@ export function create(opts)
 	//
 	//   - CONNECTED is sufficient but not necessary. An MBIM attempt aborted
 	//     while the modem was still answering sets `activated` from the late
-	//     reply (context_mbim.uc:367-371), so an IDLE context can be holding a
+	//     reply (context_mbim.uc:378-382), so an IDLE context can be holding a
 	//     session that only down() will tear down.
 	//   - ACTIVATING is not "no session yet" either: MBIM sets `activated`
-	//     before it queries the IP configuration (context_mbim.uc:382-383), NCM
-	//     before it reads its own (context_ncm.uc:742), and QMI can have
+	//     before it queries the IP configuration (context_mbim.uc:393-394), NCM
+	//     before it reads its own (context_ncm.uc:756), and QMI can have
 	//     activated families while settings are still being fetched.
 	//
 	// Each backend's down() already knows exactly what it holds. Asking it is
@@ -1437,7 +1465,7 @@ export function create(opts)
 	//
 	// AND THE RECONNECT IS STARTED HERE, not inferred from the `down` event.
 	// context_ncm.down() returns WITHOUT emitting it when the activation has
-	// not set `activated` yet (context_ncm.uc:879-882) — so a mid-dial NCM
+	// not set `activated` yet (context_ncm.uc:901-904) — so a mid-dial NCM
 	// context would have gone IDLE with `wanted` still true and nothing
 	// scheduled, wedged by the very handler meant to restart it. enter_
 	// reconnecting returns on an armed hold timer, and every emitting backend
@@ -1461,8 +1489,8 @@ export function create(opts)
 	// whether anything started it.
 	//
 	// COMPARED HERE rather than trusted from the event. modem_mbim filters its
-	// own emit on a change (modem_mbim.uc:1014-1023) while the shared reapply
-	// tail emits on every re-read (modem_common.uc:643-649); one comparison, in
+	// own emit on a change (modem_mbim.uc:1069-1078) while the shared reapply
+	// tail emits on every re-read (modem_common.uc:796-802); one comparison, in
 	// the place that acts on it, cannot disagree with itself.
 	let modem_sim_refresh = (modem, data) => {
 		let entry = self.modems[modem.id];
@@ -1820,7 +1848,7 @@ export function create(opts)
 			// Picking fields by hand would leave a DNS- or MTU-only refresh
 			// looking identical here while netifd keeps the stale values, and
 			// context_monitor_qmi already decides "did the settings change" the
-			// same way (settings_sig, :226).
+			// same way (settings_sig, :282).
 			let cur_sig = sprintf('%J', ctx.settings);
 
 			let do_renew = () => {
@@ -2102,7 +2130,7 @@ export function create(opts)
 					// The context this belongs to is gone, or was replaced —
 					// and the ENTRY check is the load-bearing half: stop_context
 					// deletes the entry from self.contexts without clearing its
-					// ctx (:1238) and shutdown replaces the whole map (:2894),
+					// ctx (:2602) and shutdown replaces the whole map (:5462),
 					// so a closure holding `entry` would still see
 					// `entry.ctx == mine` and bounce a freshly created
 					// subinterface.
@@ -2536,6 +2564,23 @@ export function create(opts)
 		return board_gpio_ok() ? deps.board.power_cycle(off) : false;
 	};
 
+	// Would board_repower() actually act on this modem? Mirrors the decision
+	// board_repower() makes above (a reset line to pulse, else a power cycle on
+	// a single-modem box that has a power GPIO) WITHOUT performing it. The
+	// zero-rx watchdog asks this before it falls through to a modem reset: a
+	// board that can repower should, and only one that cannot gets the reset,
+	// so it must not be fooled by the no-op repower closure the recovery is
+	// always handed (ddimension/wwand#59).
+	let board_can_repower = (cfg) => {
+		if (!deps.board)
+			return false;
+
+		if (board_reset_line(cfg) != null)
+			return true;
+
+		return board_gpio_ok() && !!deps.board.has_power;
+	};
+
 
 	// detach a dead modem: drop the modem object, reset device/netdev to their
 	// configured values, unbind this modem's contexts (their ctx is bound to the
@@ -2561,13 +2606,13 @@ export function create(opts)
 			};
 
 		// TELL THE CONTEXTS FIRST, then stop the modem — the order _device_gone
-		// uses (modem_common.uc:670). Dropping `centry.ctx` below only releases
+		// uses (modem_common.uc:841). Dropping `centry.ctx` below only releases
 		// the daemon's HANDLE: the context object itself lives on with its
 		// monitor timers armed and its WDS clients alive, polling a hub that
 		// entry.modem.stop() has just closed. One orphan per removal, and its
 		// late events can arm a spurious reconnect-hold on the rebuilt entry.
 		// `lost` is built for exactly this — it stops the monitor and destroys
-		// the family clients without attempting QMI cleanup (context.uc:1210).
+		// the family clients without attempting QMI cleanup (context.uc:1294).
 		for (let cname, centry in self.contexts) {
 			if (centry.cfg.modem == name && centry.ctx)
 				centry.ctx.modem_event('lost');
@@ -3181,6 +3226,11 @@ export function create(opts)
 				// power GPIO. Board fallbacks gated by board_gpio_ok (multi-modem would
 				// hit the wrong hardware). No-op when nothing safe is available.
 				repower: deps.board ? (() => board_repower(cfg)) : null,
+				// ...and whether that repower would ACTUALLY act, so the zero-rx
+				// watchdog can tell "no mechanism here" (reset the modem) from
+				// "refused" (do nothing) — board_repower above is a closure the
+				// recovery always receives even when it would no-op.
+				can_repower: deps.board ? (() => board_can_repower(cfg)) : null,
 				// the RESET line ASSIGNED TO THIS MODEM in its own section — the
 				// ladder's one permitted action on a modem that has never
 				// answered (recovery.uc, unarmed_reset_line). Not the board
@@ -3778,6 +3828,102 @@ export function create(opts)
 			};
 			self._reboot_router = reboot_router;
 
+			// one read of the Quectel UIM Remote switch per modem object, only
+			// for a modem that does not list the service (see UIMRMT_EFS); the
+			// answer is what status reports. A port that does not answer is
+			// tried again on a later tick, three times in all.
+			let uim_remote_switch_probe = (name, entry) => {
+				let m = entry?.modem;
+
+				if (!m?.at || m.uim_remote_switch != null || (m._uimrmt_tries ?? 0) >= 3 || m._uimrmt_busy)
+					return;
+
+				if (!match(lc(sprintf('%s', m.info?.manufacturer ?? '')), /quectel/))
+					return;
+
+				// only after the service list the modem gave positively left
+				// UIM Remote out: NCM has none, and a failed MBIM passthrough
+				// could not use the service whatever the switch says
+				let services = (entry.protocol == 'qmi') ? m.services
+				             : (entry.protocol == 'mbim') ? m.pt?.services : null;
+
+				if (type(services) != 'object' || services[QMI_SERVICE_UIM_REMOTE])
+					return;
+
+				m._uimrmt_busy = true;
+				m._uimrmt_tries = (m._uimrmt_tries ?? 0) + 1;
+				m.at.send(sprintf('AT+QNVFR="%s"', UIMRMT_EFS), (err, res) => {
+					m._uimrmt_busy = false;
+
+					// a bare ERROR is the item not existing (HW-observed, above);
+					// a +CME is not — 14/515 are a busy SIM or port, tried
+					// again, anything else is no answer about the switch
+					if (err?.error == 'ERROR')
+						return (m.uim_remote_switch = 'unset');
+
+					if (err?.error == 'cme' && +err.code != 14 && +err.code != 515)
+						m._uimrmt_tries = 3;
+
+					if (err)
+						return;
+
+					// 00 and 01 are the values this switch has; anything else
+					// is not evidence either way
+					for (let l in (res?.lines ?? [])) {
+						let v = match(l, /^\+QNVFR:\s*"?(00|01)"?\s*$/);
+
+						if (v)
+							return (m.uim_remote_switch = (v[1] == '00') ? 'off' : 'on');
+					}
+				}, { timeout: 5000 });
+			};
+
+			// The kernel's transmit watchdog, per modem, on the netdev that owns
+			// the queue (context_common.tx_stall_watch). One watch per modem
+			// OBJECT: a new object is a new modem as far as the stall goes, and
+			// its first reading is a baseline. Observing costs one sysfs read
+			// per tick; acting is `tx_stall_timeout` (0 = observe only).
+			// monotonic seconds; `timing.mono` is the test seam, as the 10 s
+			// timer is for the tick itself
+			let tx_clock = () => {
+				let f = self.timing?.mono ?? context_common.mono;
+
+				return f();
+			};
+			self._tx_clock = tx_clock;
+
+			let tx_stall_tick = (name, entry) => {
+				let m = entry?.modem;
+
+				if (!m) {
+					entry._txs = entry._txs_for = null;
+					return;
+				}
+
+				if (entry._txs_for !== m) {
+					entry._txs_for = m;
+					entry._txs = context_common.tx_stall_watch({
+						read: self.timing?.tx_queue_stats,
+						limit_s: () => +(m.config?.tx_stall_timeout ?? 120),
+						log: (lvl, msg) => log(lvl, sprintf('modem %s: %s', name, msg)),
+					});
+				}
+
+				let dev = m.datapath?.parent ?? m.datapath?.netdev;
+				// armed only while a session of this modem is up: with none
+				// there is no data path to rescue (tx_stall_watch)
+				let armed = false;
+
+				for (let cname, ce in self.contexts)
+					if (ce.ctx?.modem === m && ce.ctx.state == 'CONNECTED') {
+						armed = true;
+						break;
+					}
+
+				if (entry._txs.sample(dev, tx_clock(), m.counters?.proto_errors, armed) == 'trip')
+					m.trip_zero_rx?.('tx stall');
+			};
+
 			let tick;
 			tick = () => {
 				let now = time();
@@ -3892,6 +4038,12 @@ export function create(opts)
 				// optional plugins (plugins.uc): a no-op when none is installed
 				self.plugins_tick?.();
 
+				for (let name, entry in self.modems)
+					uim_remote_switch_probe(name, entry);
+
+				for (let name, entry in self.modems)
+					tx_stall_tick(name, entry);
+
 				// a radio a plugin parked, which no plugin holds any more (it
 				// stopped, failed, forgot): handed back as the plugin would
 				for (let name, entry in self.modems)
@@ -3927,6 +4079,23 @@ export function create(opts)
 		if (type(ref) != 'string' || length(ref) == 0 || length(ref) > 64)
 			return null;
 
+		// The two other spellings OpenWrt itself uses for an interface:
+		// netifd's alias form `@wwan0`, and the L3 device. watchcat hands its
+		// `option script` the configured `interface` verbatim — which is
+		// `@wwan0` or `wwand0` there, because it watches a device and refuses
+		// a bare logical name (ddimension/wwand#71).
+		//
+		// `@name` is an interface alias and nothing else, as in netifd.
+		if (substr(ref, 0, 1) == '@') {
+			let iface = substr(ref, 1);
+
+			for (let name, entry in self.contexts)
+				if (length(iface) && entry.cfg.interface == iface)
+					return name;
+
+			return null;
+		}
+
 		if (self.contexts[ref])
 			return ref;
 
@@ -3934,7 +4103,24 @@ export function create(opts)
 			if (entry.cfg.interface == ref)
 				return name;
 
-		return null;
+		// A device matches last, through the same resolution status reports
+		// as `l3_device` — and ONLY when it names one context. A parent can
+		// carry several (MBIM session 0 beside a demoted `mux auto`), and
+		// these refs drive down/redial/recovery: the first one iterated is
+		// not good enough.
+		let found = null;
+
+		for (let name, entry in self.contexts) {
+			if (derive_netdev(entry) != ref)
+				continue;
+
+			if (found != null)
+				return null;
+
+			found = name;
+		}
+
+		return found;
 	};
 
 	// context settings assembly (live config re-read, MTU/IPv6 link side effects,
@@ -4469,7 +4655,17 @@ export function create(opts)
 				// (reads fail until it clears) and the last named card event
 				// (session closed and why / internal recovery / activation)
 				sim_busy: entry.modem?.sim_busy ?? false,
-				sim_note: entry.modem?.sim_note ?? null,
+				// ...shown only while the card it was reported for is still
+				// the one in use. The indication for a card that LEAVES — a
+				// slot switch's "session closed: card removed" — arrives
+				// after simops card_changed has cleared the note, and set it
+				// again for good: the status kept naming the old card's exit
+				// through the switch and a switch back (ddimension/wwand#39).
+				// Recorded with the ICCID known then (modem.uc), so a note
+				// from the gap, ICCID unknown, goes once the new card is read.
+				sim_note: (entry.modem?.sim_note != null &&
+				           (entry.modem.sim_note_for ?? null) == (entry.modem.info?.iccid ?? null))
+					? entry.modem.sim_note : null,
 				// Die/board temperature, read over the AT side channel. It lived
 				// only on the `modem_cells` reply, and BOTH consumers reached for
 				// it on the status object instead — so `wwandctl status` and the
@@ -4537,7 +4733,7 @@ export function create(opts)
 				// answers a different structure depending on this one number
 				// (codec/mbim_schema/ms_basic_connect_ext.uc, decode_base_
 				// stations_info). It was agreed once at open and written to a
-				// single log line (mbim_client.uc:203-205), which is nowhere
+				// single log line (mbim_client.uc:207-209), which is nowhere
 				// when you are comparing wwand's reading against mbimcli's an
 				// hour later — and mbimcli opens v1 unless it is given
 				// --device-open-ms-mbimex-v3, so the two talk about different
@@ -4549,7 +4745,7 @@ export function create(opts)
 				// three cases the client cannot tell apart anyway: not an MBIM
 				// modem, the handshake refused, and the handshake not answered
 				// yet — mbim_client keeps 0 for all of the latter
-				// (mbim_client.uc:228). `protocol` separates the first from
+				// (mbim_client.uc:232). `protocol` separates the first from
 				// the other two, and the open-time log line says which of
 				// those two it was. What null must NOT become is "1.0", which
 				// would claim an extension version the modem agreed to.
@@ -4567,6 +4763,11 @@ export function create(opts)
 				at_tty: entry.modem?.at_tty,
 				// at2 released for external tools
 				at2_released: entry.modem?.at2_released,
+				// the kernel transmit watchdog on the data netdev, as the
+				// daemon tick last read it: { netdev, timeouts, stalled_s }
+				// (context_common.tx_stall_watch); null before the first read
+				tx_stall: (entry._txs_for === entry.modem && entry._txs)
+					? entry._txs.view(self._tx_clock?.() ?? context_common.mono()) : null,
 				// the modem's NMEA port, reported for gpsd to be pointed at.
 				// wwand never opens it and never links it — asking the daemon is
 				// the interface, so a re-enumerated modem answers with its new tty
@@ -4717,6 +4918,8 @@ export function create(opts)
 		let board = deps.board ? {
 			id: deps.board.id,
 			profile: deps.board.profile != null,
+			// a board file's path, or 'builtin': which of the two to edit
+			profile_source: deps.board.profile_source,
 			has_power: deps.board.has_power,
 			reset_gpio: deps.board.profile?.reset_gpio,
 		} : null;
@@ -5369,8 +5572,12 @@ export function create(opts)
 			// a modem with datapath but no AT port yet (NCM: serial ports can appear
 			// long after the netdev) sits in ABSENT backoff — a tty arrival is the cue
 			// to retry now. start() is state-guarded, so this no-ops elsewhere.
+			// Not a modem parked on a configuration error (modem_common
+			// make_fail): an unrelated device arriving cannot cure it, and a
+			// real replug rebuilds the modem object anyway.
 			for (let name, entry in self.modems) {
-				if (entry.modem && !entry.modem.at && entry.modem.state == 'ABSENT')
+				if (entry.modem && !entry.modem.at && entry.modem.state == 'ABSENT' &&
+				    !entry.modem.config_error)
 					entry.modem.start();
 			}
 		}

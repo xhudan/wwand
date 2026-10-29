@@ -129,7 +129,14 @@ export function modes_fallback_command(model)
 };
 
 // Quectel cell locking (verified on RG650E). Config:
-//   lock_4g:  list of 'earfcn:pci' (one entry -> common/4g, several -> 4g_ext)
+//   lock_4g:  list of 'earfcn:pci' -> AT+QNWLOCK="common/4g",<count>,<pairs>
+//             The second field is the NUMBER OF CELLS (0 = unlocked), not an
+//             enable flag, so one form covers one cell and a list:
+//             `AT+QNWLOCK=?` -> "common/4g",(0-10),<freq>,<pci> (RG650E,
+//             2026-10-17). "common/4g_ext" is an RG50x extra that the EG12-EA
+//             answers with ERROR (ddimension/wwand#58), and the lock check
+//             (config_check.uc check_locks) and the telemetry only read
+//             "common/4g", where a 4g_ext lock reads 0 — "not applied".
 //   lock_5g:  'pci:arfcn:scs:band' (SA only; NSA follows the locked LTE
 //             anchor, the modem answers +CME 902 there — treated as benign)
 //   lock_persist: also store the lock in modem NV (save_ctrl)
@@ -172,26 +179,18 @@ export function cell_lock_commands(cfg)
 	if (type(l4) == 'string')
 		l4 = [ l4 ];
 
-	if (length(l4) == 1) {
-		let m = match(l4[0], /^([0-9]+):([0-9]+)$/);
+	let parts = [];
+
+	for (let entry in l4) {
+		let m = match(entry, /^([0-9]+):([0-9]+)$/);
 
 		if (m)
-			push(cmds, sprintf('AT+QNWLOCK="common/4g",1,%s,%s', m[1], m[2]));
+			push(parts, sprintf('%s,%s', m[1], m[2]));
 	}
-	else if (length(l4) > 1) {
-		let parts = [];
 
-		for (let entry in l4) {
-			let m = match(entry, /^([0-9]+):([0-9]+)$/);
-
-			if (m)
-				push(parts, sprintf('%s,%s', m[1], m[2]));
-		}
-
-		if (length(parts))
-			push(cmds, sprintf('AT+QNWLOCK="common/4g_ext",%d,%s',
-				length(parts), join(',', parts)));
-	}
+	if (length(parts))
+		push(cmds, sprintf('AT+QNWLOCK="common/4g",%d,%s',
+			length(parts), join(',', parts)));
 
 	let l5 = cfg?.lock_5g;
 
@@ -240,6 +239,7 @@ export const parse_cpmutemp = parse.parse_cpmutemp;
 export const parse_meig_temp = parse.parse_meig_temp;
 export const parse_mtsm = parse.parse_mtsm;
 export const parse_ethermal = parse.parse_ethermal;
+export const parse_tsens = parse.parse_tsens;
 
 // --- AT port discovery -------------------------------------------------------
 
@@ -1183,13 +1183,44 @@ export function create(transport, opts)
 			transport.drain();
 	};
 
+	// close(): stop and drop. Whatever was queued is discarded WITHOUT its
+	// callback — every teardown is written against that: a callback that ran
+	// here would re-arm timers, advance an init chain or count a failure
+	// after the modem object has started to go (modem.uc teardown, NCM's
+	// cfun_cycle, make_fail). Use abort() where a caller must hear back.
 	self.close = function() {
 		if (self.current?.timer)
 			self.current.timer.cancel();
 
+		self.closed = true;
 		self.current = null;
 		self.queue = [];
 		transport.close();
+	};
+
+	// abort(): close, and complete what was in flight with { error: why }
+	// (default 'closed') — for the one owner that stops using a port while
+	// the modem lives on and somebody is waiting: telemetry giving up a dead
+	// at2, whose refresh would otherwise never call done() and leave its
+	// driver 'running' for good (ddimension/wwand#60). The callbacks run
+	// after the close; one that sends again must not do so on THIS engine
+	// (send() does not refuse a closed one — teardown relies on close()
+	// staying silent) — the at2 give-up switches telemetry to the control
+	// engine before it aborts, and telemetry_at() resolves it per send.
+	self.abort = function(why) {
+		let pending = [];
+
+		if (self.current)
+			push(pending, self.current);
+
+		for (let e in self.queue)
+			push(pending, e);
+
+		self.close();
+
+		for (let e in pending)
+			if (e.cb)
+				e.cb({ error: why ?? 'closed' }, null);
 	};
 
 	return self;

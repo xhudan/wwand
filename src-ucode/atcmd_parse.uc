@@ -9,8 +9,9 @@
 import * as ratmod from 'wwand.codec.schema.rat';
 
 // parse an AT+QNWLOCK read response into the lock state. Quectel formats:
-//   +QNWLOCK: "common/4g",<enable>[,<earfcn>,<pci>[,...]]
-//   +QNWLOCK: "common/4g_ext",<enable>,<count>,<earfcn>,<pci>,...
+//   +QNWLOCK: "common/4g",<num_of_cells>[,<earfcn>,<pci>[,...]]
+//   +QNWLOCK: "common/4g_ext",<num_of_cells>[,<cell_list>]
+//   (the count reads as `enabled` here: 0 cells = no lock)
 //   +QNWLOCK: "common/5g",<enable>[,<pci>,<arfcn>,<scs>,<band>]
 // returns { scope, enabled, values:[...] } for the first matching line, or null
 // when the modem answered with no lock line (unsupported / empty).
@@ -1004,6 +1005,35 @@ export function parse_ethermal(lines)
 
 		if (v > 10 && v < 120)
 			return +sprintf('%.1f', v);
+	}
+
+	return null;
+};
+
+// Foxconn T99W175 AT^TEMP?: one bare "<sensor>: <n>C" line per sensor, no
+// response prefix (terminal capture in ddimension/wwand#70, 2026-10-24):
+//
+//   PA: 32C
+//   Skin Sensor: 32C
+//   TSENS: 34C
+//   OK
+//
+// TSENS (the SoC sensor) is the reading, the same die temperature the other
+// vendors' commands report. Only that line is read: PA and skin are other
+// places on the board, and falling back to one of them would put a different
+// quantity under the same name. Anchored at the line start, because nothing
+// else marks these lines as the answer.
+export function parse_tsens(lines)
+{
+	for (let l in (lines ?? [])) {
+		let m = match(l, /^\s*TSENS:\s*(-?[0-9]+)\s*C\s*$/);
+
+		if (!m)
+			continue;
+
+		let v = +m[1];
+
+		return (v > 10 && v < 120) ? v : null;
 	}
 
 	return null;

@@ -1001,7 +1001,7 @@ scenario('wms_release', {
 // whose wire unit is not its apparent unit has to be converted at this edge.
 // WCDMA Ec/Io is the one: a raw gint16 in units of -0.5 dB, which libqmi renders
 // as (-0.5)*raw (qmicli-nas.c:460-462, 1.38.0). Left raw it disagreed with the
-// AT path, which already reports real dB (atcmd_parse.uc:356) — one key, two
+// AT path, which already reports real dB (atcmd_parse.uc:424) — one key, two
 // units, and no way for a consumer to tell which backend answered.
 scenario('signal_units', {
 	handlers: base_handlers({
@@ -1036,7 +1036,7 @@ scenario('signal_units', {
 		eq(modem.signal?.lte?.snr, 138, 'signal: lte snr stays in tenths of a dB');
 
 		// THE INDICATION IS THE SECOND DOOR. NAS SIGNAL_INFO_IND carries the
-		// same TLV layout (schema/nas.uc:419-422) and arrives BETWEEN refreshes,
+		// same TLV layout (schema/nas.uc:488-491) and arrives BETWEEN refreshes,
 		// so a conversion applied only to the polled reply would let the raw
 		// value straight back in — the same key alternating between -10 dB and
 		// 20 for one measurement. Found by review, not by the first test.
@@ -2046,10 +2046,10 @@ scenario('init-reset-no-reenum', {
 // THE UNAPPLIED-RESET DEBT DOES NOT ACCUMULATE ACROSS RETRIES.
 //
 // It is carried on `self` on purpose: the object lives for one device attach
-// (daemon.uc:1671), so a modem that really did reset comes back as a NEW
+// (daemon.uc:3306), so a modem that really did reset comes back as a NEW
 // instance with no debt, and a re-init of THIS one means it did not. But
 // re-init on the same instance is exactly what the failure path does —
-// make_fail arms `uloop.timer(backoff, () => self.start())` (modem.uc:1362) —
+// make_fail arms `uloop.timer(backoff, () => self.start())` (modem_common.uc:939) —
 // so an un-deduplicated push grows one entry per pass and repeats the warning
 // as often. Raised by Codex review, 2026-09-19.
 //
@@ -2553,6 +2553,27 @@ scenario('indications', {
 		busy_ind([ 1, 0 ]);
 		eq(modem.sim_busy, false, 'ind: ...not slot 1\'s');
 
+		// a card-side note is the active slot's: the card a slot switch left
+		// reports its exit after the switch, and that note stood for the new
+		// card for good (ddimension/wwand#39). SESSION_CLOSED_IND 0x0043:
+		// slot 0x01 (u8), cause 0x13 (u32).
+		let closed_ind = (slot) => modem.uim.dispatch({
+			kind: 'indication', msg_id: 0x0043,
+			tlvs: chr(0x01) + chr(1) + chr(0) + chr(slot) +
+			      chr(0x13) + chr(4) + chr(0) + chr(2) + chr(0) + chr(0) + chr(0),
+		});
+		let saved_iccid = modem.info.iccid;
+		modem.sim_note = null;
+		modem.info.iccid = '8949B';
+		closed_ind(1);
+		eq(modem.sim_note, null, 'ind: a session close on a slot not in use is not this card\'s note');
+		closed_ind(2);
+		ok(index(modem.sim_note ?? '', 'session closed:') == 0, 'ind: ...one on the active slot is');
+		eq(modem.sim_note_for, '8949B', 'ind: ...tagged with the card it was reported for');
+		modem.sim_note = null;
+		modem.sim_note_for = null;
+		modem.info.iccid = saved_iccid;
+
 		ok(length(mock.calls_for('REFRESH_REGISTER_ALL')) >= 1, 'ind: uim refresh registered');
 		ok(modem._uim_refresh_armed === true, 'ind: uim refresh handler armed');
 
@@ -2785,7 +2806,7 @@ scenario('cat-release-teardown', {
 // did park theirs in tm but re-armed AFTER the cancel pass, because destroying
 // the clients delivers a synchronous `cancelled` that their set_opmode callback
 // ignored. Either way the timer fires with self.dms already null
-// (modem.uc:1331) and qmi_backend.set_opmode dereferences it unguarded
+// (modem.uc:1707) and qmi_backend.set_opmode dereferences it unguarded
 // (qmi_backend.uc:66) — a throw inside a uloop callback, which kills the daemon
 // and has procd respawn it. Found by a full review, 2026-09-19.
 //
@@ -2919,7 +2940,7 @@ eq(reattach_err?.error, 'cancelled',
 // --- two waits in flight at once ---------------------------------------------
 //
 // `tm.settle` is a SHARED one-shot slot, written by the init chain too
-// (modem_init_qmi.uc:323, :383, :604). Parking radio-bounce waits there let a
+// (modem_init_qmi.uc:468, :543, :809). Parking radio-bounce waits there let a
 // second overwrite the first: teardown cancelled only the newest, the older
 // timer survived unreachable, and whichever body ran first cleared the other's
 // debt — so one of the two callers hung. Nothing serialises reattach, so two

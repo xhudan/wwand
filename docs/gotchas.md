@@ -614,7 +614,7 @@ status page drew signal only from `lte.rsrp` / `nr5g.rsrp` and otherwise printed
 at once (sponsor box, 2026-09-10).
 
 The generic `rssi` is the common floor and for some modems it is all there is:
-the FM350-GL on NCM, the EG06 on native MBIM (`telemetry_mbim.uc:42`) and any
+the FM350-GL on NCM, the EG06 on native MBIM (`telemetry_mbim.uc:59`) and any
 QMI modem camped on 2G/3G report it alone. Two of the three modems on that one
 box hit the dead end, on two different backends. Registration is what the
 registration block says (`fmt.regShort`); the absence of a measurement is not
@@ -876,6 +876,25 @@ as no model.
 *Evidence:* ddimension/wwand#45, reporter logs 2026-09-29/30 (`vendor recipe:
 generic — no manufacturer and model ?`, `cgmi -, cgmm FM350-GL`, `cgmm Fibocom
 Wireless Inc.`); #32 for the same refusal after a slot switch.
+
+## `SOCK_NONBLOCK` makes a QRTR send non-blocking
+
+**Wrong.** The kernel counts DATA packets per destination (node, port) and, once
+ten are unconfirmed, puts the sender to sleep until the remote answers with
+RESUME_TX — `wait_event_interruptible`, which never looks at `O_NONBLOCK` or
+`MSG_DONTWAIT` (`net/qrtr/af_qrtr.c` `qrtr_tx_wait` :288-291, `qrtr_sendmsg`
+:961, linux 6.18.41). A modem service that stops answering therefore freezes
+the sender inside `sendto()`: in wwand that was the whole event loop — no ubus,
+no timers, no request timeout. The counter belongs to the kernel's node, not to
+the socket, so it outlives the process; only a modem or MHI reset clears it.
+And a `while (errno == EINTR)` retry around such a send is what made the daemon
+"ignore" SIGTERM: the signal woke the wait, the loop went straight back in, and
+uloop never got to act on it. `wwand-io.c qmit_qsend` now bounds the wait with
+a one-shot SIGALRM and answers `'blocked'`; the hub (`qmi_over_qrtr.uc`) stops
+sending to that service until it answers again.
+
+*Evidence:* ddimension/wwand#61 (RG520N-EB on an IPQ5018, frozen after 7–8 h,
+SIGTERM ignored, a restarted daemon stuck in INIT_SERVICES until a modem reset).
 
 ## A called `(a ?? b.c)(…)` misplaces the stack
 

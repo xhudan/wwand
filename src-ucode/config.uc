@@ -275,9 +275,11 @@ export function modem_defaults(over)
 		at_init: [], location: false, delay: 0,
 		at2_external: false,   // release the secondary AT port for external tools
 		gnss: false,           // switch the modem's GNSS receiver on (NMEA port)
+		gnss_nmea: null,       // 'fix' | 'full': the NMEA the receiver emits (null = untouched)
 		nitz_time: true,       // step the system clock from NITZ (see deps set_clock)
 		fcc_auth: null,        // RF unlock for laptop-SKU modems (see reference.md)
 		failreboot: 100, recovery_steps: null, proto_error_limit: 25, zero_rx_timeout: 21600,
+		tx_stall_timeout: 120, // s: a stuck transmit queue resets the modem (0 = watch only)
 		unarmed_reset_after: 300,   // s: first reset-line pulse of a never-answering modem
 		card_hold: 2100,       // s: no card-resetting recovery after a subscription change
 		bearer_poll_count: 3,  // empty dial-status polls before the bearer is gone (NCM)
@@ -357,9 +359,9 @@ function apply_globals(s, result)
 const MODEM_KNOWN_OPTS = [ 'protocol', 'device', 'netdev', 'path', 'usb_path', 'serial',
 	'imei', 'repower_time', 'reset_gpio', 'reset_fallback', 'sim_detect', 'recovery_steps', 'pincode', 'modes', 'mcc', 'mnc',
 	'mux', 'dl_datagram_max_size', 'tty', 'diag_port', 'at2_external', 'gnss', 'gnss_set_time', 'nitz_time', 'fcc_auth',
-	'at_init', 'location', 'delay', 'failreboot', 'proto_error_limit',
+	'gnss_nmea', 'at_init', 'location', 'delay', 'failreboot', 'proto_error_limit',
 	'unarmed_reset_after', 'card_hold',
-	'zero_rx_timeout', 'bearer_poll_count', 'lock_4g', 'lock_5g', 'lock_persist', 'sim_slot',
+	'zero_rx_timeout', 'tx_stall_timeout', 'bearer_poll_count', 'lock_4g', 'lock_5g', 'lock_persist', 'sim_slot',
 	'stats_interval', 'auto_correct_config', 'plmn_list',
 	// the AT-over-MBIM pipe: `at_over_mbim` forces it and picks the vendor CID
 	// flavour, `at_mbim '0'` disables the automatic fallback. Both are read by
@@ -515,6 +517,9 @@ function modem_from_section(s, warnings)
 		// one switch, and wwand-gps picks the source — the modem's NMEA port,
 		// else QMI LOC (natively or over the MBIM passthrough)
 		gnss: bool_opt(s.gnss, false) || bool_opt(s.location, false),
+		// which NMEA sentences the receiver puts on its port (modem_common
+		// GNSS_NMEA); unset leaves the modem's own setting alone
+		gnss_nmea: (s.gnss_nmea != null && s.gnss_nmea != '') ? lc(s.gnss_nmea) : null,
 		// step the system clock from the receiver's own time — through
 		// deps.set_clock, which only ever touches a clock that is plainly
 		// unset (pre-2021) and so cannot fight sysntpd. OFF by default: this
@@ -566,6 +571,7 @@ function modem_from_section(s, warnings)
 		unarmed_reset_after: num_opt(s.unarmed_reset_after, 300, 'unarmed_reset_after', warnings),
 		card_hold: num_opt(s.card_hold, 2100, 'card_hold', warnings),
 		zero_rx_timeout: num_opt(s.zero_rx_timeout, 21600, 'zero_rx_timeout', warnings),
+		tx_stall_timeout: num_opt(s.tx_stall_timeout, 120, 'tx_stall_timeout', warnings),
 		bearer_poll_count: num_opt(s.bearer_poll_count, 3, 'bearer_poll_count', warnings),
 		lock_4g: (type(s.lock_4g) == 'array') ? s.lock_4g :
 		         (s.lock_4g != null ? [ s.lock_4g ] : []),
@@ -752,6 +758,16 @@ function parse_network_sections(raw, result, ext_options)
 				result.modems[name].cat_mode = null;
 			}
 
+			if (s.gnss_nmea != null && s.gnss_nmea != '' &&
+			    index([ 'fix', 'full' ], lc(s.gnss_nmea)) < 0) {
+				let m = sprintf("wwand_modem %s: gnss_nmea '%s' is not one of fix, full — ignored, the receiver keeps its own NMEA output",
+					name, s.gnss_nmea);
+
+				push(result.warnings, m);
+				push(result.modems[name].config_notes, m);
+				result.modems[name].gnss_nmea = null;
+			}
+
 			// a protocol wwand has no backend for is a typo, and a silent one:
 			// it would override a perfectly good detection with a name nothing
 			// answers to, and then look exactly like broken hardware.
@@ -909,12 +925,12 @@ function merge_iface_modem_opts(modem, s, name, mkey, warnings)
 		// THROUGH num_opt, LIKE THE NATIVE PATH. A bare `+` turns a typo into
 		// NaN, and NaN fails every comparison — `interval <= 0` is false for it
 		// — so it slips past the guards the consumers do have. That is the whole
-		// reason num_opt exists (:33), and this legacy path was the one place
+		// reason num_opt exists (:54), and this legacy path was the one place
 		// that bypassed it: `option failreboot '100s'` silently turned the
 		// reboot rung off (recovery.uc reads it as a number), and a typo'd
 		// zero_rx_timeout silently turned the watchdog off. Warning-free, on
 		// this path only. The defaults match
-		// the native reader at :456-466 so the two cannot drift apart.
+		// the native reader at :558-571 so the two cannot drift apart.
 	{
 		modem.location = num_opt(s.location, 0, 'location', warnings) > 1;   // old gate: location > 1
 
@@ -1643,7 +1659,7 @@ export function migrate_plan(raw, opts)
 				// THE ANCHORS BELONG TO THE INTERFACE THE MODEM WAS CREATED
 				// FROM. `device` is the obvious one; `netdev` is the same
 				// thing by another name — discovery resolves the modem and
-				// picks its datapath from it (discovery.uc:1041,1027), so a
+				// picks its datapath from it (discovery.uc:1081,1090), so a
 				// second interface supplying a different one would bind the
 				// section to the wrong hardware. Everything else in
 				// MIGRATE_MODEM_OPTS is modem POLICY (pincode, modes, mux,

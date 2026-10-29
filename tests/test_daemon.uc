@@ -580,6 +580,7 @@ let hw_timers = [];
 let rdeps = {
 	log: (level, msg) => null,
 	board: {
+		has_power: true,
 		profile: { reset_gpio: 'gpio900' },
 		reset_pulse: (rg, off) => { push(pulses, rg); return true; },
 		power_cycle: (off) => { cycles++; return true; },
@@ -841,6 +842,26 @@ rd.shutdown();
 	sd.modems.m0.modem.mbim = { mbimex_version: 0x0201 };
 	eq(sd.status().modems.m0.mbimex, '2.1', 'mbimex: both halves of the number survive');
 	delete sd.modems.m0.modem.mbim;
+
+	// a card event names the card it was reported for (ddimension/wwand#39):
+	// the leaving card's "card removed" arrives after a slot switch cleared
+	// the note, and must not stay on the status for the card that replaced it
+	let sm = sd.modems.m0.modem;
+	let saved_info = sm.info;
+	sm.info = { iccid: '8949A' };
+	sm.sim_note = 'session closed: card removed';
+	sm.sim_note_for = '8949A';
+	eq(sd.status().modems.m0.sim_note, 'session closed: card removed', 'sim note: shown for the card it was reported for');
+	sm.info = { iccid: '8949B' };
+	eq(sd.status().modems.m0.sim_note, null, 'sim note: not for the card that replaced it');
+	sm.sim_note_for = null;
+	sm.info = { iccid: null };
+	eq(sd.status().modems.m0.sim_note, 'session closed: card removed', 'sim note: one from the gap shows while no card is read...');
+	sm.info = { iccid: '8949A' };
+	eq(sd.status().modems.m0.sim_note, null, '...and goes once a card is (a switch back included)');
+	sm.info = saved_info;
+	delete sm.sim_note;
+	delete sm.sim_note_for;
 	eq(r.rungs[3].action, 'reboot', 'recovery view: and the reboot is last');
 	eq(r.rungs[0].fired, true, 'recovery view: opmode cycle already fired');
 	eq(r.rungs[2].fired, false, 'recovery view: the hardware rung has not');
@@ -1269,8 +1290,8 @@ rld.shutdown();
 
 	// wanA is carrying traffic; wanB is MID-DIAL, which is not the same as
 	// "holds nothing" — MBIM sets its activated flag before it queries the IP
-	// configuration (context_mbim.uc:359-360) and NCM before it reads its own
-	// (context_ncm.uc:702). wanC belongs to the other modem.
+	// configuration (context_mbim.uc:393-394) and NCM before it reads its own
+	// (context_ncm.uc:756). wanC belongs to the other modem.
 	arm('wanA', 'CONNECTED');
 	arm('wanB', 'ACTIVATING');
 	arm('wanC', 'CONNECTED');
@@ -1297,7 +1318,7 @@ rld.shutdown();
 	// AND THE RECONNECT IS ACTUALLY ENTERED. This is the half the earlier
 	// version left to an event that one backend does not send:
 	// context_ncm.down() emits nothing when the activation had not set
-	// `activated` yet (context_ncm.uc:823-826), so a mid-dial NCM context
+	// `activated` yet (context_ncm.uc:901-904), so a mid-dial NCM context
 	// would have been left IDLE and wanted with nothing scheduled.
 	ok(sd.contexts.wanA.hold_timer != null, 'sim_refresh: the dropped session enters reconnect');
 	ok(sd.contexts.wanB.hold_timer != null, 'sim_refresh: ...including the one that emitted no down event');
@@ -1320,7 +1341,7 @@ rld.shutdown();
 	// so anything calling retry_activate while a retry was already pending left
 	// two chains walking one entry, both incrementing retry_n and both calling
 	// ctx.up(). The modem-ready and adoption paths call it directly
-	// (daemon.uc:484,:556) and this handler is a third.
+	// (daemon.uc:1090,:1200) and this handler is a third.
 	let ups = 0;
 	let rc = sd.contexts.wanC.ctx;
 
@@ -1972,7 +1993,7 @@ uloop.run();
 			switch_protocol: (t, cb) => { push(switched, t); cb(fail ? { error: 'x' } : null, {}); },
 		}) },
 		context: { create: (o) => ({ state: 'IDLE', config: o.config, modem: o.modem,
-					// part of the context contract (context.uc:1037); the
+					// part of the context contract (context.uc:1282); the
 					// daemon tells a bound context when its modem is removed
 					modem_event: () => null }) },
 	};
@@ -2035,7 +2056,7 @@ uloop.run();
 
 			c = { state: 'CONNECTED', name: o.name, modem: o.modem,
 			      config: o.config,
-			      /* Faithful to every real context (context.uc:755,
+			      /* Faithful to every real context (context.uc:1218,
 			         context_mbim.uc, context_ncm.uc): the 'down' EVENT is emitted
 			         BEFORE the callback runs. A fake that only flips state and
 			         calls back cannot see an ordering bug, and this one did not —
@@ -2170,6 +2191,25 @@ uloop.run();
     let bad = null;
 	d.context_failed('nosuch', 'probe', (err, res) => { bad = err ?? res; });
 	eq(bad.error, 'no_such_context', 'failed: an unknown context is refused by name');
+
+	// watchcat hands its script the interface as configured there: `@wan`
+	// (netifd's alias form) or the L3 device — it refuses a bare logical
+	// name (ddimension/wwand#71)
+	d.modems.m0.netdev = 'wwand0';
+	eq([ d.resolve_context('@wan'), d.resolve_context('wwand0') ], [ 'wan', 'wan' ],
+		'resolve: the alias form and the L3 device name the same context');
+	eq([ d.resolve_context('@'), d.resolve_context('@nosuch'), d.resolve_context('wwand9') ],
+		[ null, null, null ], 'resolve: an empty or unknown alias and an unknown device are no context');
+
+	// `@name` is an interface alias only, never a section; a section wins
+	// over a device of its own name; a device two contexts share names none
+	d.contexts.sec = { cfg: { interface: 'logical', modem: 'm0' } };
+	eq([ d.resolve_context('@logical'), d.resolve_context('@sec') ], [ 'sec', null ],
+		'resolve: the alias form resolves the interface, not a section of that name');
+	eq(d.resolve_context('sec'), 'sec', 'resolve: a section name still wins');
+	eq(d.resolve_context('wwand0'), null,
+		'resolve: a device two contexts share is ambiguous — refused, not the first one');
+	delete d.contexts.sec;
 })();
 
 // --- the outage state must survive EVERY rebuild, not just the normal one -----
@@ -2313,7 +2353,7 @@ uloop.run();
 				stop: () => null, note_connect_success: () => null,
 				note_connect_failure: () => null, datapath: {} }) },
 				context: { create: (o) => ({ state: 'IDLE', config: o.config, modem: o.modem,
-					// part of the context contract (context.uc:1037); the
+					// part of the context contract (context.uc:1282); the
 					// daemon tells a bound context when its modem is removed
 					modem_event: () => null }) } }),
 			emit_event: () => null, kick_interface: () => null,
@@ -4449,6 +4489,76 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	mods.mb.pt = null;
 	mods.mb._pt_failed = true;
 	eq(rs('mb')?.supported, false, 'remote SIM: no passthrough on this MBIM modem — no');
+
+	// ...but on a Quectel "not listed" is usually "switched off": the service
+	// is registered only when an EFS item enables it, read at boot (RG502Q-EA,
+	// EG06-E: listed only after 00 -> 01 and a reset, 2026-10-24). The tick asks
+	// once; the reason then says which it is.
+	let sent = [], answer = null;
+	mods.q.services = { '1': {}, '26': {} };
+	mods.q.info = { manufacturer: 'Quectel' };
+	mods.q.at = { send: (cmd, cb) => { push(sent, cmd); cb(answer.err, answer.res); } };
+	mods.mb.info = { manufacturer: 'Quectel' };
+	mods.mb.at = mods.q.at;
+	mods.q.services = null;
+	d._tick();
+	eq(length(sent), 0, 'remote SIM switch: no service list (QMI not read, MBIM passthrough failed) — not asked');
+	mods.q.services = { '1': {}, '26': {} };
+
+	answer = { err: null, res: { lines: [ '+QNVFR: 00' ] } };
+	d._tick();
+	eq(length(sent), 1, 'remote SIM switch: a Quectel that does not list UIM Remote is asked once');
+	ok(index(sent[0], 'uim_remote_service_enable') > 0, 'remote SIM switch: ...for the EFS enable item');
+	eq([ rs('q')?.supported, rs('q')?.switch ], [ false, 'off' ], 'remote SIM switch: 00 — off');
+	ok(index(rs('q')?.reason ?? '', 'switched off in the modem firmware') >= 0, 'remote SIM switch: ...and the reason says so, with the remedy');
+	d._tick();
+	eq(length(sent), 1, 'remote SIM switch: ...and not again');
+
+	delete mods.q.uim_remote_switch;
+	answer = { err: { error: 'ERROR' }, res: null };
+	d._tick();
+	eq(rs('q')?.switch, 'unset', 'remote SIM switch: ERROR — the item does not exist, the firmware default (off)');
+
+	delete mods.q.uim_remote_switch;
+	delete mods.q._uimrmt_tries;
+	answer = { err: { error: 'cme', code: '14' }, res: null };
+	d._tick();
+	eq(rs('q')?.switch, null, 'remote SIM switch: SIM busy (CME 14) is not an unset item');
+	answer = { err: { error: 'cme', code: '4' }, res: null };
+	d._tick(); d._tick();
+	eq([ rs('q')?.switch, mods.q._uimrmt_tries ], [ null, 3 ], 'remote SIM switch: another CME says nothing about it — not asked again');
+
+	delete mods.q._uimrmt_tries;
+	answer = { err: null, res: { lines: [ '+QNVFR:' ] } };
+	d._tick();
+	answer = { err: null, res: { lines: [ '+QNVFR: FF' ] } };
+	d._tick();
+	eq(rs('q')?.switch, null, 'remote SIM switch: an empty or unknown value is neither off nor on');
+
+	delete mods.q.uim_remote_switch;
+	delete mods.q._uimrmt_tries;
+	answer = { err: null, res: { lines: [ '+QNVFR: 01' ] } };
+	d._tick();
+	ok(rs('q')?.switch == 'on' && index(rs('q').reason, 'needs a reset') > 0,
+		'remote SIM switch: 01 but not listed — on, and read at boot: needs a reset');
+
+	delete mods.q.uim_remote_switch;
+	delete mods.q._uimrmt_tries;
+	answer = { err: { error: 'timeout' }, res: null };
+	d._tick(); d._tick(); d._tick(); d._tick();
+	eq([ mods.q.uim_remote_switch, length(sent) ], [ null, 10 ],
+		'remote SIM switch: a port that does not answer is tried three times, then left alone');
+
+	sent = [];
+	delete mods.q._uimrmt_tries;
+	mods.q.services = { '1': {}, '50': {} };
+	d._tick();
+	eq(length(sent), 0, 'remote SIM switch: a modem that lists UIM Remote is not asked');
+	mods.q.services = { '1': {} };
+	mods.q.info = { manufacturer: 'Sierra Wireless' };
+	d._tick();
+	eq([ length(sent), rs('q')?.reason ], [ 0, 'the modem offers no QMI UIM Remote service' ],
+		'remote SIM switch: another vendor is not asked, and keeps the plain reason');
 	d.shutdown();
 }
 
@@ -4580,6 +4690,84 @@ eq(am_opts.m0?.datapath?.mux_auto, false,
 	fail({ error: 'qmi', code: 14 });
 	eq(reattaches, 1, 'a dial the modem REFUSED does not cycle the radio');
 	d.shutdown();
+}
+
+// --- a modem parked on a configuration error stays parked on hotplug --------
+// make_fail parks it in ABSENT with `config_error` set (#66). The hotplug
+// add path restarts AT-less ABSENT modems (the NCM tty-arrival cue); an
+// unrelated device arriving must not un-park this one, while an ordinary
+// backoff-waiting modem is still restarted.
+{
+	let hp = daemon_mod.create({ timing: TIMING, deps: { log: (l, m) => null } });
+	let starts = { parked: 0, waiting: 0 };
+	hp.autosetup = false;
+	hp.modems = {
+		parked: { cfg: {}, modem: { state: 'ABSENT', config_error: 'configuration error in datapath: x',
+		                            start: () => starts.parked++ } },
+		waiting: { cfg: {}, modem: { state: 'ABSENT', start: () => starts.waiting++ } },
+	};
+	hp.contexts = {};
+	hp.hotplug('add', 'ttyUSB9');
+	eq(starts.parked, 0, 'hotplug: a modem parked on a config error is not restarted');
+	eq(starts.waiting, 1, 'hotplug: ...an ordinary ABSENT modem still is');
+}
+
+// THE TRANSMIT WATCHDOG, READ ON THE TICK. The daemon samples the kernel's
+// tx_timeout count of each modem's data netdev, reports it in status(), and
+// hands a stall that lasts tx_stall_timeout to the modem's zero-rx recovery
+// (ddimension/wwand#72: the modem stopped taking packets and the link froze
+// until a manual restart).
+{
+	let fx = fakefx.create({ files: {} });
+	let now = 0, n = 4, trips = [];
+	let fake = {
+		modem: { create: (o) => ({
+			id: o.id, state: 'READY', config: o.config, start: () => null, stop: () => null,
+			datapath: { parent: 'wwq0' }, counters: { proto_errors: 0 },
+			trip_zero_rx: (why) => push(trips, why),
+		}) },
+		context: { create: (o) => ({ state: 'CONNECTED', name: o.name, modem: o.modem, config: o.config,
+			down: (cb) => cb ? cb() : null, up: (cb) => null, modem_event: () => null }) },
+	};
+	let mkd = (opts) => {
+		let d = daemon_mod.create({ timing: { ...TIMING, mono: () => now, tx_queue_stats: (dev) => (dev == 'wwq0') ? { timeouts: n, tx_packets: 500 } : null },
+			deps: { log: () => null, load_qmi: () => fake, datapath_fx: fx,
+				giveups_file: '/tmp/test-giveups-txs.json', admin_downs_file: '/tmp/test-admin-txs.json',
+				kick_interface: () => null, renew_interface: () => null, down_interface: () => null,
+				iface_status: (i, cb) => cb({ up: false, pending: false, autostart: false, errors: [] }) } });
+
+		d.apply_config(config.parse({ network: {
+			m0:  { '.type': 'wwand_modem', device: '/dev/mock0', protocol: 'qmi', ...opts },
+			wan: { '.type': 'interface', proto: 'wwand', modem: 'm0', device: 'l3', apn: 'a', pdp_type: 'ipv4' },
+		} }));
+		return d;
+	};
+
+	let d = mkd({});
+	d._tick();
+	eq(d.status().modems.m0.tx_stall, { netdev: 'wwq0', timeouts: 0, stalled_s: null },
+	   'tx stall: status reports the watched netdev, timeouts before the watch not counted');
+
+	for (now = 10; now <= 130; now += 10) {
+		n++;
+		d._tick();
+	}
+	now = 130;
+	eq(d.status().modems.m0.tx_stall?.stalled_s, 120, 'tx stall: status shows how long the queue has been stuck');
+	eq(trips, [ 'tx stall' ], 'tx stall: 120 s (the default) hands it to the modem recovery, once');
+	d.shutdown();
+
+	trips = []; now = 0; n = 0;
+	d = mkd({ tx_stall_timeout: '0' });
+	for (now = 10; now <= 300; now += 10) {
+		n++;
+		d._tick();
+	}
+	eq(trips, [], 'tx stall: tx_stall_timeout 0 only watches');
+	eq(d.status().modems.m0.tx_stall?.timeouts, 30, 'tx stall: ...and still counts');
+	d.shutdown();
+	unlink('/tmp/test-giveups-txs.json');
+	unlink('/tmp/test-admin-txs.json');
 }
 
 done('test_daemon');

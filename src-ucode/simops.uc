@@ -10,6 +10,8 @@
 import * as uloop from 'uloop';
 import * as sim from 'wwand.sim';
 import * as sms from 'wwand.sms';
+import * as ussd from 'wwand.ussd';
+import * as sms_rx from 'wwand.sms_rx';
 
 // The states of a modem's init chain up to and including the SIM step: a
 // modem in one of them reads its card as part of that chain.
@@ -20,6 +22,7 @@ export function install(self, o)
 	let log = o.log;
 	let check_modem = o.check_modem;
 	let load_esim = o.load_esim;
+	let store_pincode = o.store_pincode;
 
 	// injectable so the deferred card re-read can be driven from a test: this
 	// module's only timer is armed after a slot switch, long after the suite's
@@ -127,7 +130,7 @@ export function install(self, o)
 		// nothing on either path ever clears them (evidence:
 		// ddimension/wwand#39, NR7101).
 		//
-		// modem.uc:1745-1750 already states the rule — card-side
+		// modem.uc:2119-2124 already states the rule — card-side
 		// diagnostics belong to the card we were talking to — and acts on
 		// it during teardown. This path is the other place a card changes
 		// underneath us, and it did not.
@@ -139,7 +142,7 @@ export function install(self, o)
 		// AND THE MATCHED PER-SIM OVERRIDE, which is the one that can do
 		// damage rather than merely mislead. `active_sim` is the wwand_sim
 		// entry resolved for the card that just left, and effective_pincode
-		// prefers its `pincode` over the modem's own (sim.uc:57-70) — so
+		// prefers its `pincode` over the modem's own (sim.uc:58-71) — so
 		// the unlock scheduled below would have offered the OLD card's PIN
 		// to the new one and spent one of three attempts on it. Its APN and
 		// credentials would have applied too, until a reapply replaced it.
@@ -166,7 +169,7 @@ export function install(self, o)
 		// belongs to this module, not to the modem, so it outlives the
 		// teardown and would talk to a client that is mid-initialisation.
 		// `_gen` is the counter both backends already bump on teardown
-		// (modem.uc:1674, modem_mbim.uc:2905); NCM has none and degrades to
+		// (modem.uc:2042, modem_mbim.uc:3285); NCM has none and degrades to
 		// the identity check, which is the case its reset already answers.
 		let gen = m._gen;
 		// ...and a card change of its own: a remote SIM that comes and goes
@@ -218,7 +221,9 @@ export function install(self, o)
 		return true;
 	};
 
-	self.modem_sim_switch_slot = function(ref, physical, cb) {
+	// opts: { force } past an ICCID-bound interface using the card, or
+	// { for_interface } from that interface's own switch (daemon sim_binding)
+	self.modem_sim_switch_slot = function(ref, physical, cb, opts) {
 		let entry = check_modem(ref, cb);
 
 		if (!entry)
@@ -226,6 +231,12 @@ export function install(self, o)
 
 		if (!(physical > 0))
 			return cb({ error: 'invalid_slot' });
+
+		let user = self.sim_bound_user?.(ref, opts);
+
+		if (user)
+			return cb({ error: 'sim_in_use', interface: user,
+			            detail: sprintf('interface %s is bound to the card in use; ifdown it first, or pass force', user) });
 
 		sim.switch_slot(entry.modem, physical, (err, res) => {
 			if (err)
@@ -302,7 +313,52 @@ export function install(self, o)
 		});
 	};
 
-	self.modem_sim_pin_lock = function(ref, pin, enable, cb) {
+	// Where the card's PIN comes from at the next SIM step, as
+	// sim.effective_pincode resolves it (the one-shot override aside): the
+	// wwand_sim matched to the card when it carries one, else the modem.
+	// -> { stype, section, value, holder } (holder: the running object to
+	// update in place, so the reload after the write finds nothing to do).
+	let pin_source = (ref, m) => {
+		let sp = m.active_sim?.pincode;
+
+		if (sp != null && sp != '' && m.active_sim.section)
+			return { stype: 'wwand_sim', section: m.active_sim.section, value: sp, holder: m.active_sim };
+
+		return { stype: 'wwand_modem', section: ref, value: m.config?.pincode ?? '', holder: m.config };
+	};
+
+	// Put `pin` into the config after the card accepted it. `old` = the PIN
+	// the card held before: the source is rewritten only while it still holds
+	// that one, so a PIN configured for another card (a per-SIM override the
+	// card does not match) is never touched. `store` = also write it where no
+	// PIN is configured at all. -> the `config` part of the reply.
+	let keep_pin = (ref, m, pin, old, store) => {
+		let src = pin_source(ref, m);
+
+		if (src.value == pin)
+			return { updated: false, reason: 'unchanged', section: src.section };
+
+		if (src.value == '' ? !store : (old == null || src.value != old))
+			return { updated: false, reason: (src.value == '') ? 'none_configured' : 'configured_pin_differs',
+			         section: src.section };
+
+		if (type(store_pincode) != 'function')
+			return { updated: false, reason: 'no_writer' };
+
+		let w = store_pincode(src.section, src.stype, pin, src.value,
+			{ iccid: m.info?.iccid, imsi: m.info?.imsi });
+
+		if (w?.written && src.holder)
+			src.holder.pincode = pin;
+
+		return { updated: !!w?.written, reason: w?.reason, section: src.section };
+	};
+
+	let pin_args = (pin) => match(pin ?? '', /^[0-9]{4,8}$/);
+
+	// opts: { store, force }. `store` writes the PIN into the config when the
+	// query is turned ON and none is configured — the next boot asks for it.
+	self.modem_sim_pin_lock = function(ref, pin, enable, cb, opts) {
 		let entry = check_modem(ref, cb);
 
 		if (!entry)
@@ -311,11 +367,97 @@ export function install(self, o)
 		if (!length(pin ?? ''))
 			return cb({ error: 'missing_pin' });
 
+		if (!pin_args(pin))
+			return cb({ error: 'invalid_pin', detail: 'PIN must be 4-8 digits' });
+
 		sim.set_pin_lock(entry.modem, enable, pin, (err, res) => {
-			if (!err)
-				log('notice', sprintf('modem %s: SIM PIN query %s', ref, enable ? 'enabled' : 'disabled'));
-			cb(err, res);
-		});
+			if (err)
+				return cb(err);
+
+			log('notice', sprintf('modem %s: SIM PIN query %s', ref, enable ? 'enabled' : 'disabled'));
+
+			// the snapshot status() shows was read at the SIM step; without
+			// this the page goes on showing the old state until the next start
+			let m = entry.modem;
+
+			m.pin1 = { ...(m.pin1 ?? {}), enabled: !!enable, state: enable ? 2 : 3 };
+
+			// the card just took this PIN, so it is the right one: a source
+			// holding another value would fail the next SIM step. NOT when the
+			// query was on already — then nothing was sent, the card never saw
+			// the PIN, and a typo would be stored as the PIN to enter at start.
+			if (enable && opts?.store && !res.already)
+				res.config = keep_pin(ref, entry.modem, pin, pin_source(ref, entry.modem).value, true);
+			else if (enable && opts?.store)
+				res.config = { updated: false, reason: 'not_verified' };
+
+			cb(null, res);
+		}, { force: !!opts?.force });
+	};
+
+	// change PIN1 (ubus modem_sim_pin_change). The configured PIN follows when
+	// it was the old one: otherwise the next start enters a PIN the card no
+	// longer has, and the SIM step burns an attempt on every start until the
+	// low-retry guard stops it. opts: { store, force }.
+	self.modem_sim_pin_change = function(ref, old_pin, new_pin, cb, opts) {
+		let entry = check_modem(ref, cb);
+
+		if (!entry)
+			return;
+
+		if (!pin_args(old_pin) || !pin_args(new_pin))
+			return cb({ error: 'invalid_pin', detail: 'PINs must be 4-8 digits' });
+
+		sim.change_pin(entry.modem, old_pin, new_pin, (err, res) => {
+			if (err)
+				return cb(err);
+
+			log('notice', sprintf('modem %s: SIM PIN changed (via %s)', ref, res.via));
+
+			res.config = keep_pin(ref, entry.modem, new_pin, old_pin, !!opts?.store);
+			cb(null, res);
+		}, { force: !!opts?.force });
+	};
+
+	// USSD (ubus modem_ussd): op 'send' { text } — a code, or the answer to
+	// the question the network asked last; 'cancel'; 'status' (the session
+	// and the last message, network-initiated ones included). ussd.uc never
+	// re-sends a code over a second transport.
+	self.modem_ussd = function(ref, op, text, cb) {
+		let entry = check_modem(ref, cb);
+
+		if (!entry)
+			return;
+
+		let m = entry.modem;
+
+		if (op == 'send')
+			return ussd.send(m, text, (err, res) => {
+				if (!err)
+					log('info', sprintf('modem %s: USSD answered via %s%s', ref, res.via,
+						res.action_required ? ' (the network wants a reply)' : ''));
+				cb(err, res);
+			});
+
+		if (op == 'cancel')
+			return ussd.cancel(m, cb);
+
+		if (op == 'status' || op == null || op == '')
+			return cb(null, ussd.status(m) ?? { session: 'idle', via: null, last: null });
+
+		cb({ error: 'invalid_argument', detail: 'op is send, cancel or status' });
+	};
+
+	// the last Cell Broadcast messages (ubus modem_cell_broadcast), newest
+	// first, and whether the config switches the feature (null = untouched)
+	self.modem_cell_broadcast = function(ref, cb) {
+		let entry = check_modem(ref, cb);
+
+		if (!entry)
+			return;
+
+		cb(null, { configured: entry.modem.config?.cell_broadcast ?? null,
+		           messages: sms_rx.messages(entry.modem) });
 	};
 
 	// raw APDU channel (eSIM foundation; also used by the lpac glue).
@@ -390,9 +532,12 @@ export function install(self, o)
 		// "fixing" the `?? default` patterns elsewhere in this tree that work
 		// precisely because the key is absent.
 		//
-		// So a positive index is required. SMS storage records are numbered from
-		// 1 (3GPP TS 51.011 EF_SMS is a linear fixed file, record 1 upwards), so
-		// this refuses nothing a modem can actually address.
+		// So a bare `index` must be positive. That does refuse a real slot: QMI
+		// WMS numbers its memory indexes from 0 (a listing with slot 0 in ME and
+		// a delete of [0, 1, 2] in SM: ddimension/wwand#94), and so may AT. A
+		// bare 0 cannot be told apart from the placeholder an empty LuCI
+		// selection sends next to its list, so slot 0 is reached through
+		// `indices` only — sms_delete takes 0 there, and wwandctl sends a list.
 		let which = (type(indices) == 'array' && length(indices)) ? indices
 			: ((+index > 0) ? +index : null);
 
@@ -533,6 +678,13 @@ export function install(self, o)
 			return cb({ error: 'esim_managed', by: g.by,
 			            detail: sprintf('%s; pass force to override', g.reason ?? sprintf('this card is managed by %s', g.by)) });
 
+		// enable and disable change the card in use (see modem_sim_switch_slot)
+		let user = (op == 'enable' || op == 'disable') ? self.sim_bound_user?.(ref, params) : null;
+
+		if (user)
+			return cb({ error: 'sim_in_use', interface: user,
+			            detail: sprintf('interface %s is bound to the card in use; ifdown it first, or pass force', user) });
+
 		return br.modem_esim(ref, op, params, cb);
 	};
 
@@ -661,9 +813,10 @@ export function install(self, o)
 	// PIN in one operation. Digits-only validation keeps it AT/shell-safe; the
 	// transport chain in sim.unblock_puk never retries a PUK on a second
 	// transport (wrong PUKs brick the SIM). On success the state machine
-	// restarts with the new PIN as a one-shot override — the CONFIGURED
-	// pincode must still be updated by the user (surfaced in the reply).
-	self.sim_puk_unblock = function(ref, puk, new_pin, cb) {
+	// restarts with the new PIN as a one-shot override, and the configured PIN
+	// follows it (keep_pin: whatever the source held, the card now has the new
+	// one; `store` writes it where none is configured). opts: { store }.
+	self.sim_puk_unblock = function(ref, puk, new_pin, cb, opts) {
 		let entry = check_modem(ref, cb);
 
 		if (!entry)
@@ -681,13 +834,17 @@ export function install(self, o)
 			if (err)
 				return cb(err);
 
+			let kept = keep_pin(ref, entry.modem, new_pin,
+				pin_source(ref, entry.modem).value, !!opts?.store);
+
 			entry.modem._pin_override = new_pin;
 			entry.modem.pin_force = true;
 			entry.modem.stop();
 			entry.modem.start();
 
-			cb(null, { ...res,
-				note: 'SIM unblocked - update the configured pincode to the new PIN' });
+			cb(null, { ...res, config: kept,
+				note: (kept.updated || kept.reason == 'unchanged') ? null
+					: 'SIM unblocked - update the configured pincode to the new PIN' });
 		});
 	};
 };

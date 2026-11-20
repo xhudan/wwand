@@ -602,6 +602,183 @@ scenario('pinlock: a send failure is terminal too', (next) => {
 	});
 });
 
+// A PIN typed by hand costs an attempt when it is wrong. With one left, a typo
+// PUK-locks the card — so the guard of the automatic entry applies, unless the
+// caller insists (force).
+scenario('pinlock: one attempt left refuses, force goes through', (next) => {
+	let calls = [];
+	let m = { timing: T, config: {}, uim: mkclient({
+		GET_CARD_STATUS: { card_status: card(uimmod.APP_STATE_READY, 1) },
+		SET_PIN_PROTECTION: {},
+	}, calls) };
+
+	sim.set_pin_lock(m, false, '1234', (err) => {
+		eq(err?.error, 'low_retries', 'pinlock-low: refused');
+		eq(err?.retries, 1, 'pinlock-low: the attempts left are reported');
+		ok(index(calls, 'SET_PIN_PROTECTION') < 0, 'pinlock-low: nothing sent');
+
+		sim.set_pin_lock(m, false, '1234', (err2) => {
+			eq(err2, null, 'pinlock-low: force sends it');
+			ok(index(calls, 'SET_PIN_PROTECTION') >= 0, 'pinlock-low: ...once');
+			next();
+		}, { force: true });
+	});
+});
+
+// a request that is already satisfied sends nothing, so the guard has nothing
+// to protect and must not turn it into a failure
+scenario('pinlock: already in the state wins over the retry guard', (next) => {
+	let m = { timing: T, config: {}, uim: mkclient({
+		GET_CARD_STATUS: { card_status: card(uimmod.APP_STATE_READY, 1) },   // enabled
+	}, []) };
+
+	sim.set_pin_lock(m, true, '1234', (err, res) => {
+		eq(err, null, 'pinlock-already-low: no error');
+		eq(res?.already, true, 'pinlock-already-low: already');
+		next();
+	});
+});
+
+// native MBIM without the passthrough: the PIN set carries ENABLE/DISABLE
+scenario('pinlock: native MBIM when there is no QMI', (next) => {
+	let seen = [];
+	let m = { timing: T, config: {},
+		mbim_pin: { lock: (enable, pin, cb) => { push(seen, [ enable, pin ]); cb(null, {}); } },
+		at: { send: (cmd, cb) => { push(seen, 'AT'); cb(null, {}); } },
+	};
+
+	sim.set_pin_lock(m, false, '1234', (err) => {
+		eq(err, null, 'pinlock-mbim: done');
+		eq(seen, [ [ false, '1234' ] ], 'pinlock-mbim: MBIM DISABLE, AT not reached');
+		next();
+	});
+});
+
+// the guard's fallback on a native MBIM modem is the snapshot of its bring-up:
+// a failed attempt must lower it, or the guard sees two on a card with one
+scenario('pinchange: a failed MBIM attempt lowers the snapshot the guard reads', (next) => {
+	let m = { timing: T, config: {}, pin1: { state: 2, retries: 2, enabled: true },
+		mbim_pin: { change: (o, n, cb) => cb({ status: 'wrong pin' }) },
+	};
+
+	sim.change_pin(m, '1234', '5678', (err) => {
+		ok(err != null, 'pinchange-mbim: the wrong PIN surfaces');
+		eq(m.pin1.retries, 1, 'pinchange-mbim: the snapshot drops to 1');
+
+		sim.change_pin(m, '1234', '5678', (err2) => {
+			eq(err2?.error, 'low_retries', 'pinchange-mbim: the next try needs force');
+			next();
+		});
+	});
+});
+
+// native MBIM asks the card live (PIN List): a disabled PIN refuses a change and
+// answers a disable as done, sending nothing — on the ME906s both used to go to
+// the card with the typed PIN (2026-11-19)
+scenario('pin ops: native MBIM reads the PIN state live', (next) => {
+	let sent = [];
+	let m = { timing: T, config: {},
+		mbim_pin: {
+			status: (cb) => cb({ state: 3, retries: 3 }),
+			change: (o, n, cb) => { push(sent, 'change'); cb(null, {}); },
+			lock:   (e, p, cb) => { push(sent, 'lock'); cb(null, {}); },
+		},
+	};
+
+	sim.change_pin(m, '1234', '5678', (err) => {
+		eq(err?.error, 'pin_disabled', 'mbim-live: a change on a disabled PIN is refused');
+
+		sim.set_pin_lock(m, false, '1234', (err2, res) => {
+			eq(res?.already, true, 'mbim-live: a disable on a disabled PIN is done already');
+			eq(sent, [], 'mbim-live: nothing reached the card');
+			next();
+		});
+	});
+});
+
+// --- change_pin ----------------------------------------------------------------
+
+scenario('pinchange: UIM carries old and new PIN', (next) => {
+	let calls = [], sent;
+	let m = { timing: T, config: {}, uim: mkclient({
+		GET_CARD_STATUS: { card_status: card(uimmod.APP_STATE_READY, 3) },
+		CHANGE_PIN: (args, cb) => { sent = args.info; cb(null, {}); },
+	}, calls) };
+
+	sim.change_pin(m, '1234', '5678', (err, res) => {
+		eq(err, null, 'pinchange: done');
+		eq(res?.via, 'uim', 'pinchange: via UIM');
+		eq(sent?.old_pin, '1234', 'pinchange: old PIN sent');
+		eq(sent?.new_pin, '5678', 'pinchange: new PIN sent');
+		eq(sent?.pin_id, uimmod.PIN_ID_PIN1, 'pinchange: PIN1');
+		next();
+	});
+});
+
+// the card refuses CHANGE CHV on a disabled PIN; nothing is sent for it
+scenario('pinchange: a disabled PIN is refused before anything is sent', (next) => {
+	let calls = [];
+	let c = card(uimmod.APP_STATE_READY, 3);
+
+	c.cards[0].applications[0].pin1_state = 3;
+
+	let m = { timing: T, config: {}, uim: mkclient({ GET_CARD_STATUS: { card_status: c } }, calls) };
+
+	sim.change_pin(m, '1234', '5678', (err) => {
+		eq(err?.error, 'pin_disabled', 'pinchange-disabled: refused');
+		ok(index(calls, 'CHANGE_PIN') < 0, 'pinchange-disabled: nothing sent');
+		next();
+	});
+});
+
+scenario('pinchange: one attempt left refuses', (next) => {
+	let calls = [];
+	let m = { timing: T, config: {}, uim: mkclient({
+		GET_CARD_STATUS: { card_status: card(uimmod.APP_STATE_READY, 1) },
+	}, calls) };
+
+	sim.change_pin(m, '1234', '5678', (err) => {
+		eq(err?.error, 'low_retries', 'pinchange-low: refused');
+		ok(index(calls, 'CHANGE_PIN') < 0, 'pinchange-low: nothing sent');
+		next();
+	});
+});
+
+// a QMI reject falls through to DMS; a wrong old PIN there stops the chain —
+// AT+CPWD must not spend a second attempt on it
+scenario('pinchange: reject falls through, a wrong PIN stops', (next) => {
+	let calls = [];
+	let m = { timing: T, config: {},
+		uim: mkclient({
+			GET_CARD_STATUS: { card_status: card(uimmod.APP_STATE_READY, 3) },
+			CHANGE_PIN: { __err: { error: 'qmi', code: 94 } },
+		}, calls),
+		dms: mkclient({
+			CHANGE_PIN: { __err: { error: 'qmi', code: 12 }, data: { retries: { verify: 2 } } },
+		}, calls),
+		at: { send: (cmd, cb) => { push(calls, 'AT'); cb(null, {}); } },
+	};
+
+	sim.change_pin(m, '1234', '5678', (err) => {
+		eq(err?.retries, 2, 'pinchange-chain: retries surfaced');
+		eq(length(filter(calls, (c) => c == 'CHANGE_PIN')), 2, 'pinchange-chain: UIM, then DMS');
+		ok(index(calls, 'AT') < 0, 'pinchange-chain: AT never tried after a real PIN error');
+		next();
+	});
+});
+
+scenario('pinchange: AT+CPWD when there is nothing else', (next) => {
+	let sent = [];
+	let m = { timing: T, config: {}, at: { send: (cmd, cb) => { push(sent, cmd); cb(null, {}); } } };
+
+	sim.change_pin(m, '1234', '5678', (err, res) => {
+		eq(err, null, 'pinchange-at: done');
+		eq(sent[0], 'AT+CPWD="SC","1234","5678"', 'pinchange-at: 27.007 syntax');
+		eq(res?.via, 'at', 'pinchange-at: via AT');
+		next();
+	});
+});
+
 // --- write_user_plmn via AT+CPOL/CPLS ----------------------------------------
 
 // a mock AT channel: records every command; answers AT+CPOL? with two existing
@@ -1645,6 +1822,97 @@ scenario('ipae: ES10 refused on an IPAe-capable card -> its IPAe is in charge', 
 	next();
 });
 
+// An IDEMIA card serves ES10 only once the device declared an IPAd with
+// TERMINAL CAPABILITY tag 84 (HW-seen behind an RG502Q, 2026-11-11): the card
+// below answers 6985 until it has seen that declaration on the basic channel.
+// `denied` models an EG25-G (HW-seen 2026-11-11): QMI refuses the basic
+// channel with ACCESS_DENIED, and its AT port carries the same APDU through.
+function tc_modem(ipa, tc_sw, denied)
+{
+	let m = { timing: T, config: { ipa_mode: ipa }, _gen: 1, apdus: [], at_cmds: [] };
+	let declared = false;
+
+	if (denied)
+		m.at = { send: (cmd, cb) => {
+			push(m.at_cmds, cmd);
+
+			if (index(cmd, 'AT+CSIM=') != 0)
+				return cb({ error: 'ERROR' }, null);
+
+			declared = (tc_sw == '9000');
+			cb(null, { lines: [ sprintf('+CSIM: 4,"%s"', uc(tc_sw)) ] });
+		} };
+
+	m.uim = mkclient({
+		OPEN_LOGICAL_CHANNEL: { channel_id: 1, select_response: hex_to_bytes(FCI_IOT) },
+		SEND_APDU: (args, cb) => {
+			let h = lc(join('', map(args.apdu, (b) => sprintf('%02x', b))));
+
+			push(m.apdus, { channel: args.channel_id, apdu: h });
+
+			if (substr(h, 0, 4) == '80aa' && denied)
+				return cb({ error: 'qmi', result: 1, code: 82 }, null);
+
+			if (substr(h, 0, 4) == '80aa') {
+				declared = (tc_sw == '9000');
+				return cb(null, { response: hex_to_bytes(tc_sw) });
+			}
+
+			cb(null, { response: hex_to_bytes(declared ? 'bf20039000' : '6985') });
+		},
+		LOGICAL_CHANNEL: {},
+	}, []);
+
+	return m;
+}
+
+scenario('ipad: option ipa_mode declares the IPAd before the ISD-R open, then ES10 answers', (next) => {
+	let got = {};
+	let on = tc_modem('ipad', '9000');
+	let off = tc_modem(null, '9000');
+
+	sim.card_euicc_info(on, (v) => { got.on = v?.ipa; });
+	sim.card_euicc_info(off, (v) => { got.off = v?.ipa; });
+
+	eq(got, { on: 'ipad', off: 'ipae' }, 'ipad: declared -> IPAd; not asked for -> the card keeps its IPAe');
+	eq(on.apdus[0], { channel: null, apdu: '80aa000005a903840101' },
+		'ipad: TERMINAL CAPABILITY A9 { 84 01 01 } first, on the basic channel');
+	eq(length(filter(off.apdus, (a) => substr(a.apdu, 0, 4) == '80aa')), 0,
+		'ipad: nothing declared without the option');
+
+	sim.card_euicc_info(on, () => null);
+	eq(length(filter(on.apdus, (a) => substr(a.apdu, 0, 4) == '80aa')), 2,
+		'ipad: declared again before every ISD-R open (a card reset in between drops it)');
+
+	let refused = tc_modem('ipad', '6d00');
+	sim.card_euicc_info(refused, (v) => { got.refused = v?.ipa; });
+	eq(got.refused, 'ipae', 'ipad: a refused declaration still opens the ISD-R and reports what the card runs');
+
+	// QMI refusing the basic channel: the AT port takes the declaration
+	let eg25 = tc_modem('ipad', '9000', true);
+	sim.card_euicc_info(eg25, (v) => { got.eg25 = v?.ipa; });
+	eq([ got.eg25, eg25.at_cmds ], [ 'ipad', [ 'AT+CSIM=20,"80AA000005A903840101"' ] ],
+		'ipad: a modem that denies the QMI basic channel declares over AT+CSIM instead');
+
+	// AT: the declaration goes out as AT+CSIM, ahead of the CCHO
+	let cmds = [];
+	let at = { config: { ipa_mode: 'ipad' }, _apdu_be: 'at', at: { send: (cmd, cb) => {
+		push(cmds, cmd);
+		if (index(cmd, 'AT+CSIM') == 0)
+			return cb(null, { lines: [ '+CSIM: 4,"9000"' ] });
+		cb({ error: 'ERROR' }, null);
+	} } };
+
+	sim.apdu_open(at, 1, sim.ISDR_AID, () => null);
+	eq(cmds[0], 'AT+CSIM=20,"80AA000005A903840101"', 'ipad: AT path declares with AT+CSIM');
+	ok(index(cmds[1] ?? '', 'AT+CCHO=') == 0, 'ipad: then opens the ISD-R');
+
+	cmds = [];
+	sim.apdu_open(at, 1, 'a0000000871002', () => null);
+	ok(index(cmds[0] ?? '', 'AT+CCHO=') == 0, 'ipad: not before an open of another application');
+	next();
+});
+
 // --- a card re-initialisation that never ends (sim.refresh_fallback) --------
 // An eSIM profile enable by somebody else's LPA: the card announces it and goes
 // quiet. The fallback applies what the eSIM bridge applies after its own
@@ -1880,7 +2148,8 @@ let mk_modem = (lines) => ({
 	};
 
 	sim.apdu_open(m, 1, sim.ISDR_AID, () => null);
-	eq([ mopts, qopts ], [ [ true ], [ true ] ],
+	// QMI is asked twice: the logical channel, then SEND_APDU alone
+	eq([ mopts, qopts ], [ [ true ], [ true, true ] ],
 		'apdu backend choice: the MBIM and QMI ISD-R probes do not vote on the channel');
 
 	let m2 = { mbim_uicc: { open: (aid, cb, o) => { push(mopts, o?.no_recovery ?? false); cb({ error: 'mbim', status: 2 }, null); } },
@@ -1915,6 +2184,79 @@ let mk_modem = (lines) => ({
 	qask(3);    // INTERNAL
 	qask(52);   // DEVICE_NOT_READY
 	eq(qgot, [ true, false, false ], 'euicc info: QMI not-found is final, INTERNAL / not-ready are not');
+}
+
+// SEND_APDU alone: a firmware without the QMI logical channel messages and
+// without CCHO on its AT port (Huawei E392, HW-measured 2026-11-19). The
+// channel is opened, selected and closed with the card's own commands.
+{
+	let h2a = (h) => map(match(h, /../g), (x) => hex(x[0]));
+	let a2h = (a) => join('', map(a, (b) => sprintf('%02x', b)));
+	// a card: MANAGE CHANNEL gives channel 2, the USIM answers 61xx then its
+	// FCP, an unknown application 6a82
+	let mk = (extra) => {
+		let m = { sent: [], at_cmds: [], ...extra };
+
+		m.uim = { request: (name, args, cb) => {
+			let a = a2h(args.apdu);
+
+			push(m.sent, [ name, args.channel_id ?? null, a ]);
+			if (m.deny)
+				return cb({ error: 'qmi', code: 82 }, null);
+
+			let r = (a == '0070000001') ? '029000'
+				: (a == '02a4040407a0000000871002') ? '6103'
+				: (a == '02c0000003') ? '6201aa9000'
+				: (substr(a, 2, 4) == 'a404') ? '6a82'
+				: '9000';
+
+			cb(null, { response: h2a(r) });
+		} };
+		m.at = { send: (cmd, cb) => { push(m.at_cmds, cmd); cb({ error: 'ERROR' }, null); } };
+		return m;
+	};
+
+	// the AT port has no CCHO: a real open goes on over SEND_APDU, and stays there
+	let m = mk({ _apdu_be: 'at' }), got = {};
+
+	sim.apdu_open(m, 1, 'A0000000871002', (err, ch) => { got.open = err ?? ch; });
+	eq(got.open, { channel: 2, select_response: '6201aa' }, 'qmi_apdu: MANAGE CHANNEL, SELECT by AID, GET RESPONSE');
+	eq(m.sent, [ [ 'SEND_APDU', null, '0070000001' ], [ 'SEND_APDU', null, '02a4040407a0000000871002' ],
+	             [ 'SEND_APDU', null, '02c0000003' ] ], 'qmi_apdu: no QMI channel id, the channel is in the CLA');
+	eq(m._apdu_be, 'qmi_apdu', 'qmi_apdu: the transport that worked stays');
+	m.sent = [];
+	sim.apdu_send(m, 1, 2, '0288008122' + '00', (err, r) => { got.send = err ?? r; });
+	sim.apdu_send(m, 1, 2, '00c0000010', () => null);
+	sim.apdu_send(m, 1, 2, '80e2910000', () => null);
+	eq([ got.send, map(m.sent, (x) => x[2]) ], [ '9000', [ '028800812200', '02c0000010', '82e2910000' ] ],
+		'qmi_apdu: send passes the APDU, and puts the channel into a CLA that has none');
+	m.sent = [];
+	sim.apdu_close(m, 1, 2, (err) => { got.close = err; });
+	eq([ got.close, m.sent ], [ null, [ [ 'SEND_APDU', null, '0070800200' ] ] ], 'qmi_apdu: MANAGE CHANNEL closes');
+	m.at_cmds = [];
+	sim.apdu_open(m, 1, 'A0000000871002', () => null);
+	eq(m.at_cmds, [], 'qmi_apdu: the next open does not ask the AT port again');
+
+	// an application that is not on the card: the channel is closed again, the AT answer is reported
+	m = mk({ _apdu_be: 'at' });
+	sim.apdu_open(m, 1, 'A0000000871004', (err, ch) => { got.none = err; });
+	eq([ got.none, m._apdu_be, m.sent[2] ], [ { error: 'ERROR' }, 'at', [ 'SEND_APDU', null, '0070800200' ] ],
+		'qmi_apdu: a refused SELECT closes the channel and leaves the transport as it was');
+
+	// the eUICC discovery open is not retried (a plain SIM refuses it on every modem)
+	m = mk({ _apdu_be: 'at' });
+	sim.apdu_open(m, 1, sim.ISDR_AID, () => null, { probe: 'no eUICC' });
+	eq(m.sent, [], 'qmi_apdu: the discovery open stays on AT');
+
+	// a port that has opened a channel before is not second-guessed
+	m = mk({ _apdu_be: 'at', _at_ccho_ok: true });
+	sim.apdu_open(m, 1, 'A0000000871002', (err) => { got.proven = err; });
+	eq([ got.proven, m.sent ], [ { error: 'ERROR' }, [] ], 'qmi_apdu: not behind an AT port that opens channels');
+
+	// a modem that denies SEND_APDU without a channel (EG25-G): the AT error stands
+	m = mk({ _apdu_be: 'at', deny: true });
+	sim.apdu_open(m, 1, 'A0000000871002', (err) => { got.denied = err; });
+	eq([ got.denied, m._apdu_be ], [ { error: 'ERROR' }, 'at' ], 'qmi_apdu: a modem that denies it keeps the AT answer');
 }
 
 // QMI logical channels address the LOGICAL slot: the eUICC in physical slot
@@ -2214,6 +2556,101 @@ eq(sim.multisim([], null), null, 'multisim: no slots, nothing to say');
 	shift(defers)();
 	eq(length(em.esim_info.profiles), 2, 'eSIM re-read: the second read has the list after both changes');
 	eq(length(defers), 0, 'eSIM re-read: then nothing more is pending');
+}
+
+// boot_slot: the bound interface's card wins over sim_slot, so the init does
+// not switch to sim_slot only for the ifup to switch back
+{
+	let slots = [ { physical: 1, iccid: '89490200001022832490', active: true },
+	              { physical: 2, iccid: '89882390001598474352F', active: false } ];
+	let m = { config: { sim_slot: 1 }, bound_iccid: () => ({ iccid: '89882390001598474352', interface: 'away' }) };
+
+	eq(sim.boot_slot(m, slots).slot, 2, 'boot slot: the slot holding the bound card');
+	eq(sim.boot_slot(m, null).slot, -1, 'boot slot: before the list, "look for a card"');
+	m.bound_iccid = () => ({ iccid: '89000000000000000001', interface: 'x' });
+	eq(sim.boot_slot(m, slots), { slot: 1, why: 'option sim_slot' }, 'boot slot: a bound card in no slot leaves sim_slot');
+	m.bound_iccid = null;
+	m.config.sim_slot = 0;
+	eq(sim.boot_slot(m, slots).slot, 0, 'boot slot: neither — leave as is');
+}
+
+// The configured PIN follows a PIN change: the next start would otherwise enter
+// the old one and burn an attempt per start. It is rewritten only on the
+// section the PIN comes from, and only while that still holds the OLD PIN.
+{
+	let writes = [];
+	let mk = (cfg_pin, sim_pin) => ({
+		config: { pincode: cfg_pin },
+		active_sim: (sim_pin != null) ? { section: 'card1', pincode: sim_pin } : null,
+		uim: mkclient({
+			GET_CARD_STATUS: { card_status: card(uimmod.APP_STATE_READY, 3) },
+			CHANGE_PIN: {}, SET_PIN_PROTECTION: {},
+		}, []),
+	});
+	let pself = { modems: {} };
+
+	simops.install(pself, {
+		log: () => null,
+		check_modem: (ref, cb) => pself.modems[ref] ?? null,
+		load_esim: () => null,
+		store_pincode: (section, stype, pin, expect) => {
+			push(writes, [ section, stype, pin, expect ]);
+			return { written: true };
+		},
+	});
+
+	let run = (m, f) => {
+		let out;
+
+		pself.modems.m0 = { modem: m };
+		f((err, res) => out = { err: err, res: res });
+		return out;
+	};
+
+	let m = mk('1234', null);
+	let r = run(m, (cb) => pself.modem_sim_pin_change('m0', '1234', '5678', cb));
+
+	eq(r.res?.config?.updated, true, 'pin follows: the modem\'s PIN updated');
+	eq(writes[0], [ 'm0', 'wwand_modem', '5678', '1234' ], 'pin follows: on the modem section, expecting the old PIN');
+	eq(m.config.pincode, '5678', 'pin follows: the running config holds it, the reload finds nothing');
+
+	writes = [];
+	m = mk('1234', '1111');
+	r = run(m, (cb) => pself.modem_sim_pin_change('m0', '1111', '2222', cb));
+	eq(writes[0], [ 'card1', 'wwand_sim', '2222', '1111' ], 'pin follows: the per-SIM PIN wins');
+	eq(m.active_sim.pincode, '2222', 'pin follows: ...in memory too');
+
+	writes = [];
+	m = mk('9999', null);
+	r = run(m, (cb) => pself.modem_sim_pin_change('m0', '1234', '5678', cb));
+	eq(r.res?.config?.reason, 'configured_pin_differs', 'pin follows: another configured PIN is left alone');
+	eq(length(writes), 0, 'pin follows: ...and nothing is written');
+
+	m = mk(null, null);
+	r = run(m, (cb) => pself.modem_sim_pin_change('m0', '1234', '5678', cb));
+	eq(r.res?.config?.reason, 'none_configured', 'pin follows: none configured, no store — nothing written');
+	r = run(m, (cb) => pself.modem_sim_pin_change('m0', '1234', '5678', cb, { store: true }));
+	eq(writes[0]?.[2], '5678', 'pin follows: store writes it where none is');
+
+	// turning the query on proves the PIN right: a wrong configured one is fixed
+	writes = [];
+	m = mk('0000', null);
+	m.uim = mkclient({ GET_CARD_STATUS: { card_status: (() => {
+		let c = card(uimmod.APP_STATE_READY, 3);
+		c.cards[0].applications[0].pin1_state = 3;
+		return c;
+	})() }, SET_PIN_PROTECTION: {} }, []);
+	r = run(m, (cb) => pself.modem_sim_pin_lock('m0', '1234', true, cb, { store: true }));
+	eq(writes[0], [ 'm0', 'wwand_modem', '1234', '0000' ], 'pin lock: store replaces a PIN the card just refuted');
+	// the query already on: nothing was sent, so nothing the card verified
+	writes = [];
+	m = mk(null, null);
+	r = run(m, (cb) => pself.modem_sim_pin_lock('m0', '1234', true, cb, { store: true }));
+	eq([ r.res?.already, r.res?.config?.reason, length(writes) ], [ true, 'not_verified', 0 ],
+	   'pin lock: an unchecked PIN is never stored');
+
+	r = run(m, (cb) => pself.modem_sim_pin_lock('m0', '12a4', false, cb));
+	eq(r.err?.error, 'invalid_pin', 'pin lock: a non-digit PIN never reaches a transport');
 }
 
 done('test_sim');

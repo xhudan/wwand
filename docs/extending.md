@@ -30,7 +30,7 @@ flowchart TD
   Q{"what are you adding?"}
   Q -->|"one modem misbehaves"| A["modem_quirks.uc<br/><small>a table entry, keyed by model</small>"]
   Q -->|"a vendor's AT dialect"| B["ncm_vendors.uc<br/><small>dial / auth / telemetry recipe</small>"]
-  Q -->|"a config option"| C["config.uc<br/><small>KNOWN_OPTS + the section parser</small>"]
+  Q -->|"a config option"| C["config.uc<br/><small>MODEM_KNOWN_OPTS / SIM_KNOWN_OPTS + the section parser</small>"]
   Q -->|"a whole control protocol"| D["a new backend package<br/><small>the daemon-neutral contract</small>"]
   Q -->|"a way to build the kernel link"| E["datapath_&lt;name&gt;.uc<br/><small>an add-on package</small>"]
   Q -->|"a value to show"| F["telemetry_*.uc → status → LuCI"]
@@ -46,13 +46,14 @@ table that matches the kind of quirk:
 
 | Quirk kind | Where | Shape |
 |---|---|---|
-| **AT command at init** (carrier-config, mode, vendor tweak) | `src-ucode/atcmd.uc` → `MODEL_QUIRKS` | `{ match: /regex/, commands: [ 'AT+…' ] }` |
+| **AT command at init** (carrier-config, mode, vendor tweak) | `src-ucode/atcmd.uc` → `MODEL_QUIRKS` | `{ pattern: '<regex string>', commands: [ 'AT+…' ] }` |
 | **Expectation / validation + operator warning** | `src-ucode/modem_quirks.uc` → `QUIRKS` | `{ match, expect:{…}, warn:[…], init_commands:[…] }` |
-| **QMAP aggregation datagram size** | `src-ucode/netlink.uc` (model/board table) | model → bytes; `option dl_datagram_max_size` overrides |
+| **QMAP aggregation datagram size** | nothing to add: one default (`netlink.uc` `DEFAULT_DGRAM_SIZE`, 31 KB), negotiated with the modem | `option dl_datagram_max_size` overrides; a vendor datapath caps it via `dgram_max` |
 | **Protocol-switch recipe** (QMI⇄MBIM `AT+QCFG="usbnet"`) | `src-ucode/protocol_switch.uc` | per-vendor set/reset/query commands |
 | **usbnet mode-switch** (PPP-only → rich mode) | `src-ucode/modeswitch.uc` | per-vendor `{ set, reset, query }` |
 | **AT port mapping** (which ttyUSB is AT/at2/gps) | `src-ucode/atport.uc` (generated) + `atcmd.uc` `LOCAL_PORTS` | `usbid → { ifnum: role }` |
 | **NCM dial + telemetry recipe** | `src-ucode/ncm_vendors.uc` → `VENDORS` | per-vendor `dials` + `telemetry` blocks |
+| **Cell lock** (`lock_4g` / `lock_5g`) | `src-ucode/cell_lock.uc` → `DIALECTS` | `{ name, persist, available, read, write }` — see [Cell-lock dialects](#cell-lock-dialects) |
 
 ### Worked example — "my modem needs an AT command at startup"
 
@@ -61,14 +62,14 @@ to `MODEL_QUIRKS` in `src-ucode/atcmd.uc`:
 
 ```
 const MODEL_QUIRKS = [
-    { match: /^EG06|^EM06|^RG50[0-9]|^RG65[0-9]/,
-      commands: [ 'AT+QMBNCFG="AutoSel",1' ] },
+    { pattern: '^EG06|^EM06|^RG50[02]Q', commands: [ 'AT+QMBNCFG="AutoSel",1' ] },
     // your modem:
-    { match: /^RG255/, commands: [ 'AT+MYCMD=1' ] },
+    { pattern: '^RG255', commands: [ 'AT+MYCMD=1' ] },
 ];
 ```
 
-`model_init_commands(model)` collects every matching row; the AT engine runs them
+`model_init_commands(model)` returns the commands of the FIRST matching row (so a
+more specific pattern goes above a broader one); the AT engine runs them
 once after the modem is detected, before registration. That's it — no other code
 changes. Add a `test_atcmd` assertion (`model_init_commands('RG255…')` returns
 your command) and you're done.
@@ -102,6 +103,45 @@ backend.choose(self, '_ca_be', [
 The choice is cached per modem and reset on SIM/protocol change (`backend.reset`).
 This is how CA info falls back QMI → AT+QCAINFO transparently.
 
+### Cell-lock dialects
+
+A cell lock is spelled differently by every modem family, so
+`src-ucode/cell_lock.uc` keeps one entry per dialect in `DIALECTS` and the
+callers (QMI `config_check.validate`, MBIM/NCM `modem_common.run_at_init`)
+only ever call `cell_lock.sync`. The first entry whose `read` answers is the
+modem's dialect; a modem none answers gets a warning, never a guessed write.
+Today there are two: `quectel` (`AT+QNWLOCK`) and `qmi` (NAS cell config).
+
+A new family is one entry with five members:
+
+```
+const MYVENDOR = {
+	name: 'myvendor',
+	persist: null,                 // or a tag when the dialect can make a lock survive a power cycle on request
+	available: (self) => type(self.at?.send) == 'function',
+	read: (self, cb) => {          // cb(err) when the modem does not know the command
+		self.at.send('AT+MYLOCK?', (e, r) => e ? cb(e) : cb(null, {
+			lte: [ /* 'earfcn:pci', … */ ],
+			nr5g: null,            // 'pci:arfcn:scs:band' or null
+			nr5g_supported: false,
+		}), { probe: true });
+	},
+	write: (self, log, want, plan, cb) => {
+		// plan.lte / plan.nr5g say what differs; want.lte empty / want.nr5g
+		// null means RELEASE. cb(errors), [] when everything went in.
+	},
+};
+export const DIALECTS = [ QUECTEL, MYVENDOR, QMI ];
+```
+
+Put it before `qmi` when its read is cheaper or more specific. The read must
+fail with an error on a modem that does not have the command (send it as a
+probe, so that error is not logged as a warning); a read that "answers" on
+the wrong vendor would make that modem take your writes. `sync` does the
+compare, the release of an unconfigured lock, the read-back and the
+warnings, so `write` only sends. Add a case to `tests/test_cell_lock.uc`
+with a fake AT that answers like the modem, including a release.
+
 ### AT port mapping for a new USB id
 
 The table in `src-ucode/atport.uc` is **generated** from ModemManager's udev
@@ -125,8 +165,12 @@ option (say a modem option `foo`):
 1. **Default** — add `foo` to `modem_defaults()` (or `context_defaults()`).
 2. **Parse** — read it in `modem_from_section(s)` (the `config wwand_modem`
    parser) with the right coercion (`+(s.foo ?? 0)`, `bool_opt(s.foo, false)`,
-   list handling). Context options go in the `context` case + the `option modem`
-   interface branch in `compat_translate`.
+   list handling), and add `foo` to `MODEM_KNOWN_OPTS` in `config.uc` — an
+   option missing there is reported as unknown in the modem's `config_notes`
+   (`SIM_KNOWN_OPTS` is the same list for `wwand_sim`). The parser's section
+   cases are `wwand_globals`, `wwand_modem`, `wwand_sim` and `wwand_plmnlist`;
+   interface (connection) options are read in the `option modem` interface
+   branch of `compat_translate`.
 3. **netifd** — if it's an *interface* (connection) option, declare it in
    `files/wwand-proto.sh` with `proto_config_add_string foo` so netifd tracks it
    (the daemon reads uci directly, but this keeps change-detection clean).
@@ -151,8 +195,10 @@ The config model itself (`wwand_modem` / `wwand_sim` / `interface option modem` 
 
 wwand has three control backends — **QMI**, **MBIM**, **NCM** — behind one
 **daemon-neutral contract** (`docs/backend-interface.md`). A modem object exposes
-the same methods (`start`/`stop`/`state`/`with_nas`/`attach_context`/
-`note_connect_*`/`switch_protocol` + events) and its contexts produce an
+the same duck-typed surface — written down in `src-ucode/backend.uc:20-38`: `id`,
+`state`, `config`, `info`, `reg`, `active_sim`, `at`, `timing`, `contexts[]`, the
+`modem_common.scaffolding` methods, `reset`, `reapply_sim`, plus the events — and
+its contexts produce an
 **identical `settings` shape** (`{ipv4{addr,prefix,gateway,dns[]}, ipv6{…}, mtu}`),
 so `daemon.uc`, the netifd shim and the ubus API stay protocol-neutral.
 
@@ -169,8 +215,10 @@ To add a backend `xyz`:
 2. **Lazy shim** — `src-ucode/xyz_lazy.uc` (an exportless plain script that
    `import`s the modules and returns `{ modem, context }`), because ucode's
    `require()` cannot load ES modules directly.
-3. **Loader** — a `load_xyz()` in `daemon.uc` with the same try/catch (returns
-   null when the package is absent) and a branch in `backend_for(proto)`.
+3. **Loader** — a one-line `let load_xyz = lazy_backend('wwand.xyz_lazy', …)` in
+   `daemon.uc` (returns null when the package is absent) and a branch in
+   `backend_for(proto)`, which returns `{ be, pkg }` (`pkg` names the package
+   in the "not installed" note).
 4. **Discovery** — teach `src-ucode/discovery.uc` `resolve_control(cfg)` to map
    the modem's driver/device to `xyz`.
 5. **Package** — a `wwand-xyz` package in the feed Makefile (`DEPENDS +wwand`)
@@ -202,8 +250,9 @@ modem is there (QRTR: the name server; presence in `discovery.uc`, gated in
 ## 4. Adding a datapath backend
 
 The control backend talks to the modem; the **datapath** builds the kernel side
-of the data link. wwand ships `rmnet` and `qmimux` for QMI, `vlan` for MBIM
-sessions, and `raw_ip` for no multiplexing at all. A vendor driver with its own
+of the data link. wwand ships `rmnet` and `qmimux` for QMI, `vlan` and
+`untagged` for MBIM sessions, `ethernet` for an ethernet-framed netdev (NCM/ECM,
+802.3 QMI), and `raw_ip` for no multiplexing at all. A vendor driver with its own
 mux mechanism is added as an **add-on package, without patching wwand**.
 
 > The contract itself — every field, the selection rules, what `setup()` returns
@@ -331,7 +380,7 @@ capability:
   `status.rat` (current fine access tech) + `status.caps` `{rats,iot_modes,ntn}`.
 - **A SIM EF wwand should re-apply** (like the forbidden-PLMN list `EF_FPLMN`):
   read/write via QMI UIM READ/WRITE_TRANSPARENT with an `AT+CRSM` fallback for
-  modems whose UIM rejects EF access (see `sim.uc` `read_fplmn`/`write_fplmn`),
+  modems whose UIM rejects EF access (see `sim_plmn.uc` `read_fplmn`/`write_fplmn`),
   and register it as a `wwand_plmnlist` type so the daemon restores it before
   every radio-on.
 
@@ -357,7 +406,11 @@ capability:
    (uhttpd-mod-ubus adds it to every LuCI call, and ucode's ubus module refuses
    an argument the policy does not declare — see reference.md, ubus API).
 3. **ACL** — grant read/write in the LuCI ACL JSON (`luci-app-wwand` /
-   `luci-proto-wwand` `root/usr/share/rpcd/acl.d/*.json`).
+   `luci-proto-wwand` `root/usr/share/rpcd/acl.d/*.json`). The base package
+   also ships `files/wwand-acl.json` (installed as `/usr/share/acl.d/wwand.json`):
+   it gives the unauthenticated `nobody` user the read-only telemetry methods
+   (`modem_telemetry`, `modem_signal`, `modem_cells`) — extend it only for a
+   method that is equally harmless.
 4. **Test** — assert it end-to-end in `test_daemon` (real ubusd) or against the
    daemon directly in `test_netsel`.
 
@@ -368,7 +421,7 @@ capability:
 Two packages, both editing `/etc/config/network` and calling the `wwand` ubus
 object:
 
-- **`luci-proto-wwand`** (`…/protocol/qmi.js`) — the interface/connection form
+- **`luci-proto-wwand`** (`htdocs/luci-static/resources/protocol/wwand.js`) — the interface/connection form
   under *Network → Interfaces*. Radio/SIM options are stored on the interface's
   `wwand_modem` section via the `bindModem()` redirect (so saving converts to the
   network-native model); connection options stay on the interface.
@@ -413,11 +466,68 @@ bound to the usb-serial `option` driver. The GPIO / LED names are the kernel's
 (`ls /sys/class/gpio`, `ls /sys/class/leds`). `note` is free text — JSON has no
 comments, so put the evidence there or in the device's commit.
 
-`leds` names one of the styles in `board.uc` `LED_STYLES`: `signal_bars` (one
-LED per signal bar, `names` from the weakest up, dark while unregistered) or
-`mobile` (`red`/`green`/`orange` mobile LED and a `tech` LED that lights on
-LTE; `red` and `green` are required). A panel that behaves differently needs a new style there — that part is
-code and goes into wwand.
+`leds` is one style entry or a **list** of them, for a panel with more than
+one kind of LED. Each entry names one of the styles in `board.uc`
+`LED_STYLES`:
+
+- `signal_bars` — one LED per signal bar, `names` from the weakest up, dark
+  while unregistered.
+- `mobile` — `red`/`green`/`orange` mobile LED and a `tech` LED that lights on
+  LTE; `red` and `green` are required.
+- `tech` — one LED per technology. `leds` maps any of `2g`, `3g`, `4g`, `5g`
+  (NSA or SA) to an LED; `signal` is an optional LED lit while registered;
+  `searching` an optional LED that blinks while the modem searches and is
+  steady without a modem. `cumulative: true` lights every configured
+  generation up to the current one (5G lights 4G as well); off, only the
+  current one — the setting for an RGB lamp whose channels stand for the
+  technologies, where two lit at once would mix. `weak_bars` (0–5, default 0)
+  marks a signal at or below that many bars as weak, and each LED says what it
+  does then: an entry is an LED name, or `{ "led": …, "weak": "on" | "blink" |
+  "off" }` (`on` is the default). `sweep: true` runs the technology LEDs as a
+  light while the modem searches, oldest generation first, one step every
+  300 ms; registered, they show the technology again, and with no modem they
+  are dark. It goes with or without a `searching` LED; a single technology
+  LED blinks instead, and an LED another entry lights or blinks is not part
+  of the light.
+- `signal_color` — one LED that shows the bars as a colour. `red`, `green`,
+  `blue` name its channels (at least one; a red/green LED leaves `blue` out);
+  `colors` lists the colour at 1…5 bars (default `red, red, yellow, green,
+  green`), from `off`, `red`, `green`, `blue`, `yellow`, `cyan`, `magenta`,
+  `white`; `searching` is the colour while not registered, or `{ "color": …,
+  "blink": true }`. A colour that needs a channel the entry does not name is
+  refused.
+
+Where two entries name the same LED it is lit if either lights it, and an LED
+that has not changed is not written again (a re-written `timer` trigger
+restarts the blink). Two panels from ddimension/wwand#77 as examples — a
+Xunison Exigo Hub D50 (4G and 5G LEDs, red 5G for searching) and an Arcadyan
+AW1000 (two RGB lamps):
+
+A panel with 2G/3G/4G LEDs and a running light while it connects:
+
+```json
+{ "leds": { "style": "tech", "sweep": true,
+            "leds": { "2g": "green:2g", "3g": "green:3g", "4g": "green:4g" } } }
+```
+
+```json
+{ "leds": { "style": "tech", "cumulative": true, "weak_bars": 1,
+            "searching": "red:5g",
+            "leds": { "4g": { "led": "green:4g", "weak": "blink" },
+                      "5g": { "led": "green:5g", "weak": "off" } } } }
+```
+
+```json
+{ "leds": [
+	{ "style": "tech", "cumulative": false, "weak_bars": 1, "searching": "red:5g",
+	  "leds": { "4g": "green:5g", "5g": { "led": "blue:5g", "weak": "blink" } } },
+	{ "style": "signal_color", "red": "red:signal", "green": "green:signal",
+	  "blue": "blue:signal", "colors": [ "red", "red", "yellow", "green", "green" ],
+	  "searching": { "color": "red", "blink": true } } ] }
+```
+
+A panel that behaves differently needs a new style there — that part is code
+and goes into wwand.
 
 The file is validated whole: an unknown key or a bad value gets it ignored
 with a log line naming the problem, and `board.profile_source` in

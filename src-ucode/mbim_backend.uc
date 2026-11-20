@@ -32,6 +32,8 @@ import * as bc from 'wwand.codec.mbim_schema.basic_connect';
 import * as ext from 'wwand.codec.mbim_schema.ms_basic_connect_ext';
 import * as fibocom from 'wwand.codec.mbim_schema.fibocom';
 import * as compal from 'wwand.codec.mbim_schema.compal';
+import * as nasmod from 'wwand.codec.schema.nas';
+import * as atcmd from 'wwand.atcmd';
 
 // --- native MBIM MS UICC Low Level Access (eSIM/APDU) ------------------------
 // Service UUID + CIDs and buffer layouts verified against libmbim 1.32
@@ -117,11 +119,11 @@ function at_parse_response(cmd, blob)
 	return { err: null, lines: lines };
 }
 
-// make_at_engine(mc, vendor): vendor is 'fibocom' (default) or 'compal'. Returns
-// a duck-typed AT engine. A modem that does not expose the vendor CID NAKs the
+// make_at_engine(mc, vendor, log): vendor is 'fibocom' (default) or 'compal'.
+// Returns a duck-typed AT engine; `log(level, msg)` hears its init steps. A modem that does not expose the vendor CID NAKs the
 // COMMAND -> command_raw yields an mbim error -> send() reports it, exactly like
 // a no-AT tty modem, so callers degrade gracefully.
-export function make_at_engine(mc, vendor)
+export function make_at_engine(mc, vendor, log)
 {
 	let schema = (vendor == 'compal') ? compal : fibocom;
 	let cmd_type = (schema.AT_CMD_KIND == 'query') ? mbim.CMD_QUERY : mbim.CMD_SET;
@@ -143,19 +145,10 @@ export function make_at_engine(mc, vendor)
 		}, { cmd_type: cmd_type, timeout: o?.timeout });
 	};
 
-	// best-effort sequential run (errors logged by the caller's cb), matching the
-	// tty engine's run_sequence contract.
+	// the tty engine's runner, setting steps included: sending a step object
+	// as if it were a command line put its JSON on the wire
 	self.run_sequence = function(cmds, done) {
-		let idx = 0, step;
-
-		step = () => {
-			if (idx >= length(cmds))
-				return done ? done() : null;
-
-			self.send(cmds[idx++], () => step());
-		};
-
-		step();
+		atcmd.run_sequence(self, log ?? (() => null), cmds, done);
 	};
 
 	self.close = () => null;
@@ -425,14 +418,59 @@ export function set_lte_attach_config(mc, contexts, cb)
 // The SMS service has NO storage selector (READ/DELETE act on the modem's
 // configured SMS store), unlike the QMI WMS path — so this is the fallback for
 // pure-MBIM firmware without the passthrough. PDU format only (no CDMA).
-const SMS_SERVICE = '533fbeeb-14fe-4467-9f90-33a223e56c3f';
-const SMS_CID_READ = 2;
+export const SMS_SERVICE = '533fbeeb-14fe-4467-9f90-33a223e56c3f';
+export const SMS_CID_READ = 2;
 const SMS_CID_DELETE = 4;
 const SMS_FORMAT_PDU = 0;
 const SMS_FLAG_ALL = 0;
 const SMS_FLAG_INDEX = 1;
 
 function _u(buf, p) { return (p + 4 <= length(buf)) ? struct.unpack('<I', substr(buf, p, 4))[0] : 0; }
+
+// the records of an SMS Read response or notification (same layout) ->
+// [ { index, status, pdu } ]. WHERE THE PDU OFFSET COUNTS FROM is not
+// settled: libmbim reads it from the start of the RECORD (mbim-message.c:710,
+// called with the record's offset from mbim-sms.c:75, 1.32), and the EG06
+// answered with it counted from the start of the BUFFER — the messages read
+// that way were the same ones its QMI passthrough listed (HW-validated
+// 2026-07-25, commit 1bde1da). A response uses one way for all its
+// records, so the choice is made for the response: the reading under which
+// every PDU lies inside the buffer and overlaps no record header (16 octets
+// each). The record-based one (the standard) when it qualifies, the
+// buffer-based one otherwise; with neither, the records are skipped — a
+// guess per record could hand back the bytes of another one.
+export function sms_records(resp)
+{
+	let count = _u(resp, 4), recs = [];
+
+	for (let i = 0; i < count; i++) {
+		let off = _u(resp, 8 + i * 8);             // ref pair: [offset, size]
+
+		push(recs, { off: off, index: _u(resp, off), status: _u(resp, off + 4),
+		             poff: _u(resp, off + 8), psize: _u(resp, off + 12) });
+	}
+
+	let ok_under = (pos) => {
+		for (let r in recs) {
+			let at = pos(r);
+
+			if (at + r.psize > length(resp))
+				return false;
+
+			for (let h in recs)
+				if (at < h.off + 16 && at + r.psize > h.off)
+					return false;
+		}
+
+		return true;
+	};
+
+	let rel = (r) => r.off + r.poff, abs = (r) => r.poff;
+	let pos = ok_under(rel) ? rel : ok_under(abs) ? abs : null;
+
+	return pos ? map(recs, (r) => ({ index: r.index, status: r.status,
+		pdu: hexmod.bin_to_hex(substr(resp, pos(r), r.psize)) })) : [];
+};
 
 // sms_read_all(mc, cb): read every stored PDU. cb(err, [{ index, status, pdu }]).
 // Response (MbimSmsRead, PDU): Format(u32), MessagesCount(u32), then a
@@ -447,19 +485,22 @@ export function sms_read_all(mc, cb)
 		if (err)
 			return cb(err, null);
 
-		let count = _u(resp, 4), out = [];
-
-		for (let i = 0; i < count; i++) {
-			let off = _u(resp, 8 + i * 8);             // ref pair: [offset, size]
-			let idx = _u(resp, off), status = _u(resp, off + 4);
-			let poff = _u(resp, off + 8), psize = _u(resp, off + 12);
-
-			push(out, { index: idx, status: status, pdu: hexmod.bin_to_hex(substr(resp, poff, psize)) });
-		}
-
-		cb(null, out);
+		cb(null, sms_records(resp));
 	});
 };
+
+
+// Message Store Status (CID 5, notification): Flag, MessageIndex
+// (mbim-service-sms.json:177-190, libmbim 1.32); NEW_MESSAGE = 1 << 1
+// (mbim-enums.h:986-990)
+export const SMS_CID_STORE_STATUS = 5;
+export const SMS_FLAG_NEW_MESSAGE = 2;
+
+export function sms_store_status(info)
+{
+	return (length(info ?? '') >= 8) ? { flag: _u(info, 0), index: _u(info, 4) } : null;
+};
+
 
 // sms_delete(mc, index, cb): delete one stored message by index.
 export function sms_delete(mc, index, cb)
@@ -467,6 +508,55 @@ export function sms_delete(mc, index, cb)
 	let info = struct.pack('<II', SMS_FLAG_INDEX, +index);
 
 	mc.command_raw(SMS_SERVICE, SMS_CID_DELETE, info, (err) => cb(err ?? null));
+};
+
+// --- USSD (MBIM USSD service, libmbim 1.32 mbim-service-ussd.json:8-37) ------
+// One CID, set + notification, no query. Set: Action, DataCodingScheme,
+// Payload ref-byte-array; response and notification: Response, SessionState,
+// DataCodingScheme, Payload. The DCS is the 23.038 CBS byte itself (unlike
+// QMI's), the payload packed GSM7 or UCS2 big-endian as the DCS says
+// (ModemManager mm-broadband-modem-mbim.c:8447-8510, 1.25.95), at most 160
+// octets.
+export const USSD_SERVICE = 'e550a0c8-5e82-479e-82f7-10abf4c3351f';
+export const USSD_CID = 1;
+export const USSD_ACTION_INITIATE = 0;
+export const USSD_ACTION_CONTINUE = 1;
+export const USSD_ACTION_CANCEL = 2;
+// MbimUssdResponse (mbim-enums.h:1024-1031)
+export const USSD_RESPONSE = [ 'no_action_required', 'action_required', 'terminated_by_network',
+	'other_local_client', 'operation_not_supported', 'network_timeout' ];
+
+export function ussd_encode_set(action, dcs, payload)
+{
+	let p = payload ?? '';
+	let pad = (4 - (length(p) % 4)) % 4;
+
+	return struct.pack('<IIII', action, dcs ?? 0, length(p) ? 16 : 0, length(p)) + p +
+		substr('\x00\x00\x00', 0, pad);
+};
+
+// response or notification -> { response, response_name, session_state,
+// dcs, payload } (payload a binary string); null when too short
+export function ussd_decode(info)
+{
+	if (length(info ?? '') < 20)
+		return null;
+
+	let r = _u(info, 0), off = _u(info, 12), len = _u(info, 16);
+
+	return {
+		response: r,
+		response_name: USSD_RESPONSE[r] ?? sprintf('%d', r),
+		session_state: _u(info, 4),
+		dcs: _u(info, 8),
+		payload: (len && off + len <= length(info)) ? substr(info, off, len) : '',
+	};
+};
+
+export function ussd_set(mc, action, dcs, payload, cb)
+{
+	mc.command_raw(USSD_SERVICE, USSD_CID, ussd_encode_set(action, dcs, payload), (err, resp) =>
+		cb(err ?? null, err ? null : ussd_decode(resp)), { timeout: 100000 });
 };
 
 // how many neighbour cells to ask the modem for (BASE_STATIONS_INFO caps)
@@ -558,6 +648,25 @@ function plmn_str(provider_id)
 	return sprintf('%s/%s', substr(provider_id, 0, 3), substr(provider_id, 3));
 }
 
+// The 2G/3G names for a class mask without LTE or 5G, the highest generation
+// first — or null. WITHOUT THEM A FALLBACK TO 2G READ AS LTE: a Huawei ME906s
+// that lost LTE and re-registered on GPRS/EDGE (available 0x03,
+// 2026-11-18) gave no mode, the caller rightly keeps the last known one on
+// a failed read, and status said "LTE" for hours on an EDGE link.
+function legacy_mode(dc)
+{
+	if (dc & (ext.DATA_CLASS_HSDPA | ext.DATA_CLASS_HSUPA))
+		return 'HSPA';
+	if (dc & ext.DATA_CLASS_UMTS)
+		return 'UMTS';
+	if (dc & ext.DATA_CLASS_EDGE)
+		return 'EDGE';
+	if (dc & ext.DATA_CLASS_GPRS)
+		return 'GSM';
+
+	return null;
+}
+
 // get_signal(mc, cb): per-RAT signal from Signal State, normalized to the QMI
 // self.signal shape { lte:{rssi,rsrq,rsrp,snr}, nr5g:{rsrp,snr} }, or cb(null).
 // That layout has no per-RAT RSRQ, so lte.rsrq is null.
@@ -573,7 +682,12 @@ function plmn_str(provider_id)
 // cb(signal, blank): `blank` lists the RATs whose RsrpSnr entry carried no
 // reading at all (both indexes 0, see rsrp_dbm) and was therefore left out —
 // so the caller can log the placeholder instead of a -157 dBm cell.
-export function get_signal(mc, cb)
+//
+// `data_class` (optional) is the registration's available class mask: an
+// RSSI-only reading belongs to the generation the modem is on. Filed under
+// LTE regardless, an ME906s on EDGE showed "LTE rssi -89 dBm" (2026-11-18).
+// Unknown, or LTE/5G in the mask, keeps it under `lte`.
+export function get_signal(mc, cb, data_class)
 {
 	mc.command(bc, 'SIGNAL_STATE_V2', 'query', {}, (err, data) => {
 		if (err || !data)
@@ -608,8 +722,19 @@ export function get_signal(mc, cb)
 				out.nr5g = { rsrp: rsrp, snr: snr };
 		}
 
-		// RSSI present but no LTE RsrpSnr entry — still surface the RSSI
-		if (!out.lte && rssi != null)
+		// RSSI present but no LTE RsrpSnr entry — still surface the RSSI, under
+		// the generation it was measured on (the shape QMI's SIGNAL_INFO fills:
+		// `gsm_rssi`, `wcdma.rssi`)
+		let gen = legacy_mode(data_class ?? 0);
+
+		if (!out.lte && !out.nr5g && rssi != null && gen != null &&
+		    !(data_class & (ext.DATA_CLASS_LTE | ext.DATA_CLASS_5G_NSA | ext.DATA_CLASS_5G_SA))) {
+			if (gen == 'GSM' || gen == 'EDGE')
+				out.gsm_rssi = rssi;
+			else
+				out.wcdma = { rssi: rssi };
+		}
+		else if (!out.lte && rssi != null)
 			out.lte = { rssi: rssi, rsrq: null, rsrp: null, snr: null };
 
 		return cb(length(out) ? out : null, blank);
@@ -807,7 +932,8 @@ export function get_cells(mc, cb)
 	});
 };
 
-// get_data_mode(mc, cb): data-system mode { mode, lte, nr } (mode LTE/NSA/SA) —
+// get_data_mode(mc, cb): data-system mode { mode, lte, nr } (mode LTE/NSA/SA,
+// or HSPA/UMTS/EDGE/GSM on a modem registered below LTE) —
 // the MBIM analogue of qmi_backend.get_data_mode. Derived from the register
 // state's available data classes (MbimDataClass bitmask: LTE / 5G-NSA / 5G-SA).
 // REGISTRATION_PARAMETERS carries no data-class field, so the register state's
@@ -821,7 +947,7 @@ export function get_data_mode(mc, cb)
 		let dc = data.available_data_classes;
 		let lte = (dc & ext.DATA_CLASS_LTE) != 0;
 		let nr = (dc & (ext.DATA_CLASS_5G_NSA | ext.DATA_CLASS_5G_SA)) != 0;
-		let mode = nr ? (lte ? 'NSA' : 'SA') : (lte ? 'LTE' : null);
+		let mode = nr ? (lte ? 'NSA' : 'SA') : (lte ? 'LTE' : legacy_mode(dc));
 
 		// NO MODE IS NOT A MODE. Returning { mode: null } here reads as a
 		// successful answer to every caller — it is a truthy object — so the
@@ -860,4 +986,100 @@ export function get_reg_detail(mc, cb)
 
 		cb(d);
 	}, { no_recovery: true });
+};
+
+// --- network modes as an MBIM data-class mask ---------------------------------
+// MBIM selects the radio technologies through the DataClass of a Register
+// State set and, from MBIMEx 2.0 on, reports what it holds as
+// PreferredDataClasses. wwand's modes are the NAS mode bits (`option modes`,
+// nasmod.MODE_BITS), so these convert both ways. The per-RAT mapping is
+// ModemManager's (mm_mbim_data_class_from_modem_mode and
+// mm_modem_mode_from_mbim_data_class, mm-modem-helpers-mbim.c:212-283,
+// ModemManager 1.24.0). TD-SCDMA has no data class of its own: it is dropped
+// on the way out and never read back, so a caller compares only MODES_MBIM.
+export const MODES_MBIM = nasmod.MODE_ALL & ~nasmod.MODE_BITS['td-scdma'];
+
+const DC_GSM  = ext.DATA_CLASS_GPRS | ext.DATA_CLASS_EDGE;
+const DC_UMTS = ext.DATA_CLASS_UMTS | ext.DATA_CLASS_HSDPA | ext.DATA_CLASS_HSUPA;
+const DC_NR   = ext.DATA_CLASS_5G_NSA | ext.DATA_CLASS_5G_SA;
+const DC_CDMA = ext.DATA_CLASS_1XRTT | ext.DATA_CLASS_1XEVDO | ext.DATA_CLASS_1XEVDO_REVA |
+                ext.DATA_CLASS_1XEVDV | ext.DATA_CLASS_3XRTT | ext.DATA_CLASS_1XEVDO_REVB;
+
+// WHICH STANDARD BIT THE CUSTOM BIT STANDS FOR. Some firmware reports a class
+// it supports as CUSTOM plus a free-text name in DEVICE_CAPS, and expects
+// CUSTOM back in a set: a Foxconn T99W175 (Snapdragon X55) reports
+// "umts, hsdpa, hsupa, lte, 5g-nsa, custom" with the name "5G UWB", and its
+// CUSTOM is 5G SA. Sent the standard 5G_SA bit instead, it drops the bit and
+// holds "lte, 5g-nsa" afterwards (HW-observed, T99W175.F0.0.0.3.0.GC.003 over
+// MBIMEx 2.0, 2026-11-08). The table and the primary/secondary rule are
+// ModemManager's (custom_data_classes and mm_mbim_data_class_from_custom_caps,
+// mm-modem-helpers-mbim.c:34-66, 1.24.0): the same name means NSA on a modem
+// whose caps lack 5G_NSA and SA on one that already lists it. Returns the
+// standard bits CUSTOM stands for, 0 when it stands for none we know.
+const CUSTOM_CLASSES = [
+	[ '5GSA',  ext.DATA_CLASS_5G_SA,  0 ],
+	[ '5G',    ext.DATA_CLASS_5G_NSA, ext.DATA_CLASS_5G_SA ],
+	[ 'HSPA+', ext.DATA_CLASS_HSDPA | ext.DATA_CLASS_HSUPA, 0 ],
+];
+
+export function custom_class(caps_dc, custom)
+{
+	if (!((caps_dc ?? 0) & ext.DATA_CLASS_CUSTOM))
+		return 0;
+
+	let s = sprintf('%s', custom ?? '');
+
+	for (let c in CUSTOM_CLASSES)
+		if (index(s, c[0]) >= 0)
+			return (caps_dc & c[1]) ? c[2] : c[1];
+
+	return 0;
+};
+
+// modes (NAS mode bits) -> the DataClass to send, standard bits only. A mask
+// with no technology MBIM can name is 0, which a Register State set reads as
+// "any" — the caller must not send that for a configured mode list.
+export function data_class_from_modes(modes)
+{
+	let m = modes ?? 0;
+	let dc = 0;
+
+	if (m & nasmod.MODE_BITS.gsm)  dc |= DC_GSM;
+	if (m & nasmod.MODE_BITS.umts) dc |= DC_UMTS;
+	if (m & nasmod.MODE_BITS.lte)  dc |= ext.DATA_CLASS_LTE;
+	if (m & nasmod.MODE_BITS.nr5g) dc |= DC_NR;
+	if (m & nasmod.MODE_BITS.cdma) dc |= DC_CDMA;
+
+	return dc;
+};
+
+// the same DataClass with the bits CUSTOM stands for replaced by CUSTOM, as
+// ModemManager sends it to a modem without a QMI passthrough
+// (mm_modem_mbim_denormalize_data_class_mask, mm-modem-helpers-mbim.c:83-91,
+// 1.24.0) — null when CUSTOM stands for nothing in dc
+export function data_class_custom(dc, caps_dc, custom)
+{
+	let cc = custom_class(caps_dc, custom);
+
+	return (cc && (dc & cc)) ? ((dc & ~cc) | ext.DATA_CLASS_CUSTOM) : null;
+};
+
+// a reported DataClass (PreferredDataClasses) -> NAS mode bits, CUSTOM read as
+// the bits it stands for on this modem
+export function modes_from_data_class(dc, caps_dc, custom)
+{
+	let d = dc ?? 0;
+
+	if (d & ext.DATA_CLASS_CUSTOM)
+		d = (d & ~ext.DATA_CLASS_CUSTOM) | custom_class(caps_dc, custom);
+
+	let m = 0;
+
+	if (d & DC_GSM)              m |= nasmod.MODE_BITS.gsm;
+	if (d & DC_UMTS)             m |= nasmod.MODE_BITS.umts;
+	if (d & ext.DATA_CLASS_LTE)  m |= nasmod.MODE_BITS.lte;
+	if (d & DC_NR)               m |= nasmod.MODE_BITS.nr5g;
+	if (d & DC_CDMA)             m |= nasmod.MODE_BITS.cdma;
+
+	return m;
 };

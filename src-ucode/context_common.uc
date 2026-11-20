@@ -29,9 +29,16 @@ import * as modem_quirks from 'wwand.modem_quirks';
 // profile and in its data calls (HW-seen on 245, 2026-09-27).
 const CREDENTIALS = { auth: true, username: true, password: true };
 
+// AN IMS PDN IS NOT THE CARD'S DIAL. A wwand_sim describes how this card
+// reaches its data network: one APN, one login, one IP family. An interface
+// with `ims '1'` is a second PDN on the same card (the IM CN one) and is
+// defined by the interface alone. Taking the card's APN there dialled the
+// internet APN a second time ("call already present", HW-seen on 245,
+// 2026-11-14), and its pdp_type would ask the IMS APN for a family the
+// network refuses (Vodafone's IMS PDN is IPv6-only).
 export function conn_cfg(ctx, field)
 {
-	let sim = ctx.modem?.active_sim;
+	let sim = (ctx.config?.ims === true) ? null : ctx.modem?.active_sim;
 	let s = sim?.[field];
 
 	if (s != null && s != '')
@@ -290,6 +297,31 @@ export function tx_queue_stats(dev, root)
 	return { timeouts: total, tx_packets: match(p, /^[0-9]+$/) ? +p : null };
 };
 
+// netdev_stats(dev, root): the kernel's counters for a data netdev, in the
+// shape the contexts publish as `stats` (plus `source: 'netdev'`), or null
+// when the device does not exist. The fallback for a modem whose own counters
+// stay at zero while data flows — see the callers for when each one uses it.
+export function netdev_stats(dev, root)
+{
+	if (!dev || match(dev, /[\/]|^\.\.?$/))
+		return null;
+
+	let base = sprintf('%s/%s', root ?? '/sys/class/net', dev);
+
+	if (!fs.access(base))
+		return null;
+
+	let g = (f) => +(trim(fs.readfile(sprintf('%s/statistics/%s', base, f)) ?? '') || 0);
+
+	return {
+		tx_bytes: g('tx_bytes'), rx_bytes: g('rx_bytes'),
+		tx_packets: g('tx_packets'), rx_packets: g('rx_packets'),
+		tx_errors: g('tx_errors'), rx_errors: g('rx_errors'),
+		tx_dropped: g('tx_dropped'), rx_dropped: g('rx_dropped'),
+		source: 'netdev',
+	};
+};
+
 // How long the timeout count may stay still before a stall counts as over.
 // The watchdog re-fires every watchdog_timeo (5 s on usbnet) while the queue
 // stays stopped, but usbnet's timeout handler unlinks the queued URBs, which
@@ -330,8 +362,13 @@ export const TX_STALL_QUIET_S = 30;
 //
 // The protocol error counter is sampled at the start of a stall so the log can
 // say whether the control channel failed with it. Both together is a modem
-// that stopped answering altogether; a TX stall with the control channel still
-// answering points at the data path or the radio instead.
+// that stopped answering altogether. A streak that did NOT grow is weaker
+// evidence than it looks: the counter is consecutive failures, reset by any
+// answer (recovery.uc on_proto_success), and telemetry backs off a query that
+// keeps timing out, so a hung modem may simply not have been asked (evidence:
+// ddimension/wwand#72, the streak flat for a minute, then QMI failed the
+// reset). So the log says what the counter showed, never that the channel
+// answered.
 export function tx_stall_watch(o)
 {
 	let read = o.read ?? tx_queue_stats;
@@ -340,7 +377,7 @@ export function tx_stall_watch(o)
 
 	let control = (pe) => (pe > pe_start)
 		? sprintf('the control channel failed too (%d protocol errors)', pe - pe_start)
-		: 'the control channel kept answering';
+		: 'the control-channel error streak did not grow';
 
 	let end = (why, pe) => {
 		o.log('info', sprintf('tx stall on %s: %s after %ds; %s',

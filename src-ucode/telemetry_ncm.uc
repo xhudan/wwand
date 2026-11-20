@@ -451,14 +451,14 @@ function mk_nr(r)
 
 // wrap a parse_monsc/parse_meng_servingcell descriptor as a serving object with
 // dBm rsrp/rsrq for fill_signal_from_serving + assemble_cells
-function sc_to_serving(sc)
+export function sc_to_serving(sc)
 {
 	return { lte: mk_lte({
 		band: sc.band, earfcn: sc.earfcn, pci: sc.pci, mcc: sc.mcc, mnc: sc.mnc,
 		cid: sc.cid, tac: sc.tac, rsrp: sc.rsrp_dbm, rsrq: sc.rsrq_db,
 		sinr: sc.sinr_db ?? null,
 	}) };
-}
+};
 
 function tel_huawei_cells(self, cb)
 {
@@ -957,6 +957,41 @@ export function ca_entries(serving, sccs)
 		});
 
 	return ca;
+};
+
+// Read the active carrier-aggregation set over AT, vendor-aware. QCAINFO is a
+// Quectel command; a Fibocom (FM350 / MediaTek T7xx) answers it with a bare
+// ERROR, so the MBIM and QMI telemetry AT fallbacks — which have no native CA
+// source on such a modem — must ask the Fibocom way (AT+GTCAINFO?, the same
+// read-back the NCM Fibocom path uses) instead of thrashing on QCAINFO. Returns
+// (err, ca_list): ca_list in the shared CA shape (ca_entries / parse_qcainfo),
+// null meaning "no reading". Lives here beside the Fibocom parsers; imported by
+// telemetry_mbim and telemetry_qmi (all three telemetry modules ship in the
+// base wwand package, so this is not a cross-backend package dependency).
+export function read_ca_at(self, cb)
+{
+	let fibocom = match(self.info?.manufacturer ?? '', /fibocom/i) ||
+	              match(self.info?.model ?? '', /FM[0-9]/i);
+
+	if (fibocom)
+		return modem_common.telemetry_at(self).send('AT+GTCAINFO?', (e, r) => {
+			let g = e ? null : parse_gtcainfo(r?.lines);
+			cb(e, g ? ca_entries(g, g.sccs) : null);
+		});
+
+	// QCAINFO only where Quectel firmware answers it. Sent to anyone else it
+	// is an ERROR each time the ladder re-probes — on a Foxconn T99W175, whose
+	// MBIM caps name it "Qualcomm", that was a warning in the log for nothing
+	// (evidence: ddimension/wwand#75). An unnamed manufacturer still gets it,
+	// as sim_detect_commands does, since a blank says nothing either way. The
+	// carrier list then comes from QMI alone (qmi_backend.ca_with_rf).
+	let mfr = lc(sprintf('%s', self.info?.manufacturer ?? ''));
+
+	if (mfr != '' && !match(mfr, /quectel/))
+		return cb({ error: 'unsupported', detail: 'no AT carrier read for this vendor' }, null);
+
+	return modem_common.telemetry_at(self).send('AT+QCAINFO', (e, r) =>
+		cb(e, e ? null : atcmd.parse_qcainfo(r?.lines)));
 };
 
 function tel_fibocom_cells(self, cb)

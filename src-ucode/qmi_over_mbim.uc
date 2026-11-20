@@ -76,7 +76,9 @@ export function create(mc, opts)
 
 		// Structural never-SYNC rail. CTL SYNC (service 0, msg 0x0027) resets the
 		// modem's embedded QMI state and tears down the live MBIM data session
-		// (HW-proven on EG06 — it kills the MBIM CONNECT). The passthrough must
+		// (HW-observed on the EG06 — it kills the MBIM CONNECT; recorded by
+		// 2026-07-24, the oldest tree that carries the rule, firmware not
+		// noted; docs/gotchas.md). The passthrough must
 		// NEVER carry it. Elsewhere this is convention (a comment in modem_mbim);
 		// here it is enforced: drop the frame and fail the request fast rather
 		// than let a stray SYNC reach the wire.
@@ -152,7 +154,7 @@ export function create(mc, opts)
 	// (0xff broadcast fan-out in deliver) for every service.
 	//
 	// ONE handler per MBIM client, routed to its current shim. mc.on only
-	// appends (mbim_client.uc:382) and has no counterpart, while a shim is made
+	// appends (mbim_client.uc:471) and has no counterpart, while a shim is made
 	// per bring-up: every rebuild of a passthrough that stopped answering would
 	// leave a handler behind, and every indication would run through all of
 	// them. The route lives on the client because the client outlives shims.

@@ -48,14 +48,14 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 #               not one true one. A checker that cries wolf is worse than none.
 BANNED = re.compile(r'\(\?|\\[1-9]')
 
-# STRINGS ARE SCANNED, comments are not. Four call sites build a regex from a
-# TABLE ENTRY at runtime — netlink.uc:674, atcmd.uc:96, protocol_switch.uc:71,
+# STRINGS ARE SCANNED, comments are not. Three call sites build a regex from a
+# TABLE ENTRY at runtime — atcmd.uc:112, protocol_switch.uc:71 and
 # modeswitch.uc:71 all do `regexp(<entry>.pattern)` over vendor-matching tables
 # whose patterns are string literals in the source. A banned construct there
 # compiles at first use and throws exactly like a literal would, so skipping
 # string contents would blind this checker to the likeliest place for the next
 # one to be added. Comments, by contrast, must be skipped: this tree DESCRIBES
-# the construct in prose on purpose (atcmd_parse.uc:643, :787).
+# the construct in prose on purpose (atcmd_parse.uc:652, :787).
 def scannable(line, in_block):
     """Return (text to search, new in_block) — the parts of `line` a banned
     construct could really live in.

@@ -12,6 +12,8 @@ import * as modem_quirks from 'wwand.modem_quirks';
 import * as discovery from 'wwand.discovery';
 import * as netsel_ops from 'wwand.netsel_ops';
 import * as simops from 'wwand.simops';
+import * as ussd from 'wwand.ussd';
+import * as sms_rx from 'wwand.sms_rx';
 import * as simmod from 'wwand.sim';
 import * as hwops from 'wwand.hwops';
 import * as plugins from 'wwand.plugins';
@@ -23,12 +25,14 @@ import * as recoverymod from 'wwand.recovery';
 import * as ctx_settings from 'wwand.ctx_settings';
 import * as context_common from 'wwand.context_common';
 import * as modem_common from 'wwand.modem_common';
+import * as hexmod from 'wwand.codec.hex';
+import * as tlvmod from 'wwand.codec.tlv';
 // module scope: the lazy backend loaders live outside create(), so they cannot
 // use its injected `log` dep and go to the shared sink directly
 import * as logmod from 'wwand.log';
 
 // The agreed MS extension version as text. Both halves of the u16, the way
-// mbim_client's own open-time log line writes it (mbim_client.uc:207-209) —
+// mbim_client's own open-time log line writes it (mbim_client.uc:293-295) —
 // only x.0 generations are defined today, but reading the number the way its
 // owner does is cheaper than being right about that forever.
 function mbimex_text(v)
@@ -112,7 +116,12 @@ let load_esim = lazy_backend('wwand.esim', loaded_note('esim'));
 // the attach profile and re-dials (apply_config, apply_sim_change).
 // plmn_list names the list and plmn_restore is what it resolves to: an edit to
 // the list itself changes only the second, and must still be applied.
-const SIM_EFFECT = [ 'pincode', 'apn', 'auth', 'username', 'password', 'pdp_type',
+// The `pincode` is not among them: only the SIM step reads it, and on a card
+// that is already unlocked re-programming the attach profile and re-dialling
+// for it drops the connection for nothing — a PIN change from LuCI stores the
+// new PIN, and that must not bounce the WAN. A modem at its SIM step
+// (SIM_UNLOCK, SIM_BLOCKED) is restarted by apply_config's step 1 instead.
+const SIM_EFFECT = [ 'apn', 'auth', 'username', 'password', 'pdp_type',
 	'plmn_list', 'plmn_restore' ];
 
 function sim_effect(s)
@@ -219,6 +228,11 @@ function remote_sim_support(protocol, m)
 	if (protocol == 'qmi') {
 		if (type(m.services) != 'object')
 			return { supported: null, reason: 'the modem\'s QMI services are not read yet' };
+
+		// no version table: nothing to read it from, and only a session that
+		// allocates the service would tell (modem.uc has_service)
+		if (m.services_unknown && !m._services_absent?.[QMI_SERVICE_UIM_REMOTE])
+			return { supported: null, reason: 'the modem does not list its QMI services (GET_VERSION_INFO unanswered); UIM Remote is tried when a remote SIM is used' };
 
 		return m.services[QMI_SERVICE_UIM_REMOTE]
 			? { supported: true, via: 'qmi' }
@@ -412,6 +426,7 @@ export function create(opts)
 	// A `let` referenced before its initialisation throws in ucode even from
 	// inside a closure (see wwand/CLAUDE.md), so the binding has to exist here.
 	let mark_our_down;
+	let sim_release, sim_binding;
 
 	reconnect.install(self, {
 		log: log,
@@ -423,6 +438,57 @@ export function create(opts)
 	let activate = self._activate;
 	let clear_reconnect = self._clear_reconnect;
 	let retry_activate = self._retry_activate;
+
+	// A dial the modem refused as throttled: record until when, so the retry
+	// waits instead of dialling into the back-off, and say so once per spell.
+	// Without a time from the modem (no QMI WDS client, an MBIM modem) the
+	// ordinary backoff stands and only the count is spared.
+	let note_throttle = (name, entry, ctx) => {
+		let apn = entry.cfg?.apn ?? '';
+		let was = entry.throttle;
+		let set = (secs) => {
+			entry.throttle = { apn: apn, seconds: secs,
+				until: (secs != null) ? context_common.mono() + secs : null };
+
+			if (!was || was.querying)
+				log('notice', sprintf('interface %s: the modem holds APN "%s" back after network rejections%s — waiting, not counting toward recovery',
+					name, apn, (secs != null) ? sprintf(' (%d s left)', secs) : ''));
+		};
+
+		if (type(ctx.modem.pdn_throttle) != 'function')
+			return set(null);
+
+		// the WDS answer is asynchronous, and the reconnect this same error
+		// starts would otherwise dial before it arrives (retry_activate
+		// waits while `querying`)
+		entry.throttle = { apn: apn, seconds: null, until: null, querying: true };
+
+		ctx.modem.pdn_throttle((list) => {
+			if (self.contexts[name] !== entry)
+				return;
+
+			// an APN set: its own entry only — a sole unrelated one must not
+			// hold this dial. Unset (the network's default APN): the modem
+			// names the APN the network chose, which the config cannot know,
+			// so the longest hold it reports stands for it.
+			let secs = null;
+
+			for (let t in (list ?? []))
+				if (apn == '' || lc(t.apn ?? '') == lc(apn))
+					secs = max(secs ?? 0, t.ipv4_s ?? 0, t.ipv6_s ?? 0);
+
+			set(secs);
+
+			// the retry chain may be parked on the query: start it now,
+			// deferred so a backend answering synchronously cannot re-enter
+			// the context error handler from here
+			uloop.timer(0, () => {
+				if (self.contexts[name] === entry && entry.wanted)
+					retry_activate(name);
+			});
+		});
+	};
+
 	let enter_reconnecting = self._enter_reconnecting;
 
 	// forward-declared: ucode closures capture only already-declared vars, and
@@ -505,10 +571,33 @@ export function create(opts)
 		return false;
 	};
 
+	// THE KERNEL FORGETS AN INTERFACE'S ADDRESSES WITH ITS DEVICE; netifd
+	// forgets them only when it sees the device go. An interface netifd holds
+	// without a bound device (`option device` learned after it was loaded,
+	// learn_device commits uci and does not reload) stays UP through a modem
+	// restart that took its mux child away, so the ready path adopts it — and
+	// the re-dial's update carries the same addresses, which netifd reads as
+	// unchanged and does not re-add to the new device. The interface shows up
+	// with an address the kernel no longer has (ddimension/wwand#90). The
+	// device's ifindex tells the rebuild apart from a session that survived
+	// (a wwand restart): the kernel hands them out cyclically, never reusing
+	// a freed one at once (dev_index_reserve -> xa_alloc_cyclic,
+	// net/core/dev.c:10707-10725, Linux 6.18.41). null = cannot tell.
+	let l3_ifindex = (entry) => {
+		let dev = derive_netdev(entry);
+
+		if (!dev || !deps.datapath_fx?.read)
+			return null;
+
+		let idx = trim(deps.datapath_fx.read(sprintf('/sys/class/net/%s/ifindex', dev)) ?? '');
+
+		return length(idx) ? idx : null;
+	};
+
 	// KEYED BY INTERFACE, NOT CARRIED ON THE ENTRY. The marker is evidence
 	// about an interface, and the context entry lives SHORTER than the
 	// interface. A config reload that cannot resolve an interface's modem
-	// produces no entry for it at all (config.uc:1044-1047 warns "references
+	// produces no entry for it at all (config.uc:1127-1130 warns "references
 	// unknown modem" and skips it), so a marker on the entry would have nothing
 	// to be carried over from. Re-adding the modem would then build a fresh
 	// entry with no marker, the status poll would see netifd's cleared
@@ -1065,6 +1154,13 @@ export function create(opts)
 			    !entry.ctx || entry.ctx.state != 'IDLE')
 				continue;
 
+			// a card switch of its own still on the way: the registration
+			// is the old card's, and a kick now would only ask again
+			let bound = siminventory.norm_iccid(entry.cfg.iccid);
+
+			if (bound && entry._sim_switch?.busy && bound != siminventory.norm_iccid(modem.info?.iccid))
+				continue;
+
 			// re-establish wanted contexts; ALSO re-arm one we involuntarily gave
 			// up on after a reconnect-hold blackhole (reconnect_on_register, set by
 			// context_down) now that the modem is registered again. An operator
@@ -1113,7 +1209,16 @@ export function create(opts)
 					clear_our_down(centry);
 				}
 
-				if (st?.up) {
+				// up on a device that is not the one its session came up on:
+				// netifd's addresses are gone from the kernel (see l3_ifindex),
+				// so it is reset like an orphaned setup below, not adopted. A
+				// device that cannot be read right now is no evidence: resetting
+				// on it would bounce a working session after a registration blip.
+				let cur_ifindex = st?.up ? l3_ifindex(centry) : null;
+				let rebuilt = centry._up_ifindex != null && cur_ifindex != null &&
+					cur_ifindex != centry._up_ifindex;
+
+				if (st?.up && !rebuilt) {
 					log('info', sprintf('adopting live interface %s after modem ready', centry.cfg.interface));
 					retry_activate(cname);
 				}
@@ -1147,7 +1252,7 @@ export function create(opts)
 							centry.cfg.interface));
 					}
 				}
-				else if (!(centry.cfg.auto ?? true) && !our_down(centry) && !centry.reconnect_on_register) {
+				else if (!rebuilt && !(centry.cfg.auto ?? true) && !our_down(centry) && !centry.reconnect_on_register) {
 					// 'auto 0' and not up: dormant until an explicit ifup — and
 					// not wanted meanwhile. A SIM change's down-and-reconnect
 					// (modem_sim_refresh) and the low-power decision read
@@ -1195,8 +1300,10 @@ export function create(opts)
 					// ORPHANED setup (e.g. a wwand restart mid-setup). 'up' no-ops on a
 					// pending interface, so 'down' first, then the kick re-runs setup.
 					// (A busy context never gets here: the branch above.)
-					if (st?.pending && deps.down_interface) {
-						log('info', sprintf('interface %s stuck pending, resetting before setup', centry.cfg.interface));
+					if ((st?.pending || rebuilt) && deps.down_interface) {
+						log('info', rebuilt
+							? sprintf('interface %s is up on a device that was rebuilt, resetting it so netifd applies its addresses again', centry.cfg.interface)
+							: sprintf('interface %s stuck pending, resetting before setup', centry.cfg.interface));
 						// Two markers, because two different readers ask two different
 						// questions about this down.
 						//
@@ -1336,6 +1443,8 @@ export function create(opts)
 			// when the serial-only reading started, so the settle window in
 			// start_modem is a window and not a fresh countdown per rebuild
 			_ppp_since: prev?._ppp_since,
+			// ...and the same for the wait on a control device's netdev
+			_netdev_since: prev?._netdev_since,
 		};
 	};
 
@@ -1387,7 +1496,7 @@ export function create(opts)
 
 		if (info?.sgp32)
 			log('notice', sprintf('modem %s: SGP.32 IoT eUICC (SGP.22 %s), %s', m.id, info.svn ?? '?',
-				(info.ipa == 'ipae') ? 'its own IPA (IPAe) is in charge — ES10 from the router is refused by design'
+				(info.ipa == 'ipae') ? 'its own IPA (IPAe) is in charge — ES10 from the router is refused (option ipa_mode \'ipad\' declares the router\'s IPA)'
 				: (info.ipa == 'ipad') ? 'served by the device IPA (IPAd)' : 'IPA mode unknown'));
 
 		let waiters = st.waiters;
@@ -1451,10 +1560,10 @@ export function create(opts)
 	//
 	//   - CONNECTED is sufficient but not necessary. An MBIM attempt aborted
 	//     while the modem was still answering sets `activated` from the late
-	//     reply (context_mbim.uc:378-382), so an IDLE context can be holding a
+	//     reply (context_mbim.uc:418-422), so an IDLE context can be holding a
 	//     session that only down() will tear down.
 	//   - ACTIVATING is not "no session yet" either: MBIM sets `activated`
-	//     before it queries the IP configuration (context_mbim.uc:393-394), NCM
+	//     before it queries the IP configuration (context_mbim.uc:433-434), NCM
 	//     before it reads its own (context_ncm.uc:756), and QMI can have
 	//     activated families while settings are still being fetched.
 	//
@@ -1489,8 +1598,8 @@ export function create(opts)
 	// whether anything started it.
 	//
 	// COMPARED HERE rather than trusted from the event. modem_mbim filters its
-	// own emit on a change (modem_mbim.uc:1069-1078) while the shared reapply
-	// tail emits on every re-read (modem_common.uc:796-802); one comparison, in
+	// own emit on a change (modem_mbim.uc:1092-1101) while the shared reapply
+	// tail emits on every re-read (modem_common.uc:882-888); one comparison, in
 	// the place that acts on it, cannot disagree with itself.
 	let modem_sim_refresh = (modem, data) => {
 		let entry = self.modems[modem.id];
@@ -1556,17 +1665,242 @@ export function create(opts)
 			if (centry.cfg?.modem != modem.id || !centry.ctx || !centry.wanted)
 				continue;
 
+			// AN ICCID-BOUND INTERFACE DOES NOT FOLLOW THE CARD. Re-dialled
+			// like the others, it would run on a subscription it was bound
+			// away from. No card read yet (the identity is cleared while a
+			// card changes) decides nothing; its own card is what a switch it
+			// asked for brings, and the `registered` kick takes it from there.
+			let bound = siminventory.norm_iccid(centry.cfg?.iccid);
+
+			if (bound) {
+				let fresh = siminventory.norm_iccid(data?.iccid);
+
+				if (!fresh || (bound == fresh && centry.ctx.state == 'IDLE'))
+					continue;
+
+				// Its own switch passes through other cards: the slot comes
+				// up on whatever profile that eUICC had enabled before the
+				// wanted one can be (siminventory bind_plan, slot first).
+				// Released here, the second step never ran. The switch's
+				// step count and timer bound it instead.
+				if (bound != fresh && centry._sim_switch)
+					continue;
+
+				if (bound != fresh) {
+					sim_release(name, centry, sprintf('the modem now runs card %s', fresh));
+					continue;
+				}
+			}
+
 			log('notice', sprintf('interface %s: the SIM changed under it — dropping the session so it re-dials on the new subscription',
 				name));
 			centry.ctx.down(() => enter_reconnecting(name));
 		}
 	};
 
+	// ICCID-BOUND INTERFACES (`option iccid` on the interface). The card is
+	// the connection's, not the modem's: an ifup on a modem running another
+	// card switches to it — the slot that holds it, or its eUICC profile — and
+	// dials once the modem has registered on it. One step per ifup
+	// (siminventory bind_plan): the `registered` that follows a step kicks the
+	// interface, and its next setup takes the next step or dials. Bounded by
+	// SIM_SWITCH_STEPS and SIM_SWITCH_TIMEOUT: a card that never comes up is
+	// said, and the interface stays down until the next ifup — it is not a
+	// modem fault, so the recovery ladder does not count it.
+	const SIM_SWITCH_STEPS = 3;
+	const SIM_SWITCH_TIMEOUT = 120;
+
+	let sim_bind_note = (entry, state, reason) => {
+		entry.sim_bind = { want: siminventory.norm_iccid(entry.cfg?.iccid),
+		                   state: state, reason: reason ?? null };
+	};
+
+	// what status and context_status report for a bound interface. Before any
+	// ifup of this daemon — a restart adopts a live session, a reload re-dials
+	// through the reconnect path — nothing has been noted, but whether the
+	// modem runs the card is still a fact worth showing.
+	self._sim_view = function(entry) {
+		let want = siminventory.norm_iccid(entry?.cfg?.iccid);
+
+		if (!want)
+			return null;
+
+		if (entry.sim_bind)
+			return entry.sim_bind;
+
+		let on = siminventory.norm_iccid(self.modems[entry.cfg.modem]?.modem?.info?.iccid);
+
+		return { want: want, state: (on == want) ? 'ok' : null, reason: null };
+	};
+
+	let sim_switch_end = (entry) => {
+		entry._sim_switch?.timer?.cancel?.();
+		entry._sim_switch = null;
+	};
+
+	// The modem left the card a bound interface runs on (an operator's
+	// switch, a card's own IPA changing the profile): it goes down and stays
+	// down. Brought back by itself it would switch the card back, against
+	// whoever changed it. Downed through netifd without our marker, so the
+	// teardown is recorded as an ifdown and the next ifup — the one to switch
+	// back — is the operator's.
+	sim_release = (name, entry, why) => {
+		sim_switch_end(entry);
+		entry.wanted = false;
+		sim_bind_note(entry, 'released', why);
+		log('notice', sprintf('interface %s: bound to card %s, but %s — taking it down (an ifup switches back)',
+			entry.cfg.interface ?? name, entry.sim_bind.want, why));
+
+		if (deps.down_interface)
+			deps.down_interface(entry.cfg.interface);
+	};
+
+	// context_up's part: true when it answered `cb` itself (refused, or a
+	// switch under way), false when the modem runs the card and the dial goes
+	// on as for any interface.
+	sim_binding = (name, entry, cb) => {
+		let want = siminventory.norm_iccid(entry.cfg?.iccid);
+
+		if (!want) {
+			entry.sim_bind = null;
+			return false;
+		}
+
+		let mn = entry.cfg.modem, mentry = self.modems[mn], mo = mentry?.modem;
+		let iface = entry.cfg.interface ?? name;
+
+		let refuse = (error, detail) => {
+			sim_switch_end(entry);
+			entry.wanted = false;
+			sim_bind_note(entry, 'refused', detail);
+			log('warn', sprintf('interface %s: not bringing it up — %s', iface, detail));
+			cb({ error: error, detail: detail });
+			return true;
+		};
+
+		let switching = (what) => {
+			entry.wanted = true;
+			sim_bind_note(entry, 'switching', what);
+			cb({ error: 'sim_switching', detail: what });
+			return true;
+		};
+
+		try { inventory_refresh(); }
+		catch (e) { log('warn', sprintf('SIM inventory refresh failed (%s)', e)); }
+
+		let p = siminventory.bind_plan(want, inventory.find(want), {
+			modem: mn, active: siminventory.norm_iccid(mo?.info?.iccid),
+			active_slot: mo?.active_slot,
+		});
+
+		// first: a bound interface switching the modem away from this card
+		// pulls it from under a dial made now, even while it is still in use
+		let h = siminventory.bind_holder(self.contexts, name, mn, want);
+
+		if (h)
+			return refuse('sim_in_use', sprintf('modem %s is in use by interface %s, which is bound to another card (ifdown it first)',
+				mn, self.contexts[h].cfg.interface ?? h));
+
+		if (p.action == 'ok') {
+			if (entry._sim_switch)
+				log('notice', sprintf('interface %s: modem %s runs card %s now — dialling', iface, mn, want));
+
+			sim_switch_end(entry);
+			sim_bind_note(entry, 'ok');
+			return false;
+		}
+
+		if (p.action == 'refuse')
+			return refuse(p.error, p.detail);
+
+		let sw = entry._sim_switch;
+
+		if (p.action == 'wait')
+			return switching(sw?.what ?? p.why);
+
+		if (sw?.busy)
+			return switching(sw.what);
+
+		if (sw && sw.steps >= SIM_SWITCH_STEPS)
+			return refuse('sim_switch_failed', sprintf('card %s still not in use after %d switch steps', want, sw.steps));
+
+		if (!sw) {
+			sw = entry._sim_switch = { steps: 0 };
+			sw.timer = uloop.timer(SIM_SWITCH_TIMEOUT * 1000, () => {
+				if (entry._sim_switch !== sw)
+					return;
+
+				entry._sim_switch = null;
+				entry.wanted = false;
+
+				// the card can be in use and the network refuse it (a
+				// subscription that takes IPv6 only, say) — not the same
+				// fault, and the registration_detail names that one
+				let now_on = siminventory.norm_iccid(self.modems[mn]?.modem?.info?.iccid);
+
+				sim_bind_note(entry, 'failed', (now_on == want)
+					? sprintf('modem %s runs card %s, but did not register on it within %d s (see its registration detail)', mn, want, SIM_SWITCH_TIMEOUT)
+					: sprintf('card %s not in use %d s after the switch began', want, SIM_SWITCH_TIMEOUT));
+				log('err', sprintf('interface %s: %s — taking it down', iface, entry.sim_bind.reason));
+
+				if (deps.down_interface)
+					deps.down_interface(entry.cfg.interface);
+			});
+		}
+
+		sw.steps++;
+		sw.busy = true;
+		sw.what = (p.action == 'slot')
+			? sprintf('switching modem %s to SIM slot %d for card %s', mn, p.slot, want)
+			: sprintf('enabling eSIM profile %s on modem %s', want, mn);
+
+		log('notice', sprintf('interface %s: %s', iface, sw.what));
+
+		let done = (err) => {
+			if (entry._sim_switch !== sw)
+				return;
+
+			sw.busy = false;
+
+			if (err)
+				return refuse('sim_switch_failed', sprintf('%s failed: %J', sw.what, err));
+
+			switching(sw.what);
+		};
+
+		if (p.action == 'slot')
+			self.modem_sim_switch_slot(mn, p.slot, (err) => done(err), { for_interface: name });
+		else
+			self.modem_esim(mn, 'enable', { iccid: want, slot: p.slot, for_interface: name }, (err) => done(err));
+
+		return true;
+	};
+
+	// A manual card change (slot switch, eSIM enable/disable) on a modem whose
+	// card a bound interface is using pulls the card from under it: refused
+	// unless forced, naming the interface. Forced, the interface is released
+	// once the new card is read (modem_sim_refresh). The bound interface's own
+	// switch passes `for_interface`.
+	self.sim_bound_user = function(ref, opts) {
+		if (opts?.force || opts?.for_interface)
+			return null;
+
+		for (let n in sort(keys(self.contexts))) {
+			let c = self.contexts[n];
+
+			if (c?.cfg?.modem == ref && siminventory.norm_iccid(c.cfg.iccid) &&
+			    (c._sim_switch || (c.ctx && c.ctx.state != 'IDLE')))
+				return c.cfg.interface ?? n;
+		}
+
+		return null;
+	};
+
 	// A live edit of the override that matches the card in use: re-program
-	// the attach profile (reapply_sim, which cycles the radio only when the
-	// profile really changed), then re-dial the sessions still up, which were
-	// dialled with the old values. Only on a modem past its init chain: one
-	// that is still coming up reads the new list on its own.
+	// the attach profile (reapply_sim, which re-attaches only when the profile
+	// really changed), then re-dial the sessions still up, which were dialled
+	// with the old values. Only on a modem past its init chain: one that is
+	// still coming up reads the new list on its own.
 	let apply_sim_change = (mn, m) => {
 		log('notice', sprintf('modem %s: the SIM override of the card in use changed — applying it', mn));
 
@@ -1595,6 +1929,16 @@ export function create(opts)
 		// tell a reset that happened from one that was only acknowledged).
 		if (event == 'state' && data?.state == 'ABSENT')
 			modem._absent_count = (modem._absent_count ?? 0) + 1;
+
+		// listen for network-initiated USSD from the first registration on
+		// (MBIM/AT: the hook; QMI: the Voice client and its indications) —
+		// they come only while registered, and are otherwise lost unseen
+		if (event == 'registered') {
+			ussd.arm(modem);
+			// new SMS and Cell Broadcast from here on, and the broadcast
+			// switched as the config says (sms_rx.uc)
+			sms_rx.arm(modem, (level, msg) => log(level, sprintf('modem %s: %s', modem.id, msg)));
+		}
 
 		// clear the one-shot manual-PIN-release flags so a later cycle never reuses them
 		if (event == 'registered' || event == 'sim_blocked') {
@@ -1738,6 +2082,32 @@ export function create(opts)
 
 		case 'identity_mismatch':
 			modem_identity_mismatch(modem, data);
+			emit('wwand.modem', { modem: modem.id, event: event, ...(data ?? {}) });
+			return;
+
+		// what the network sent on its own (ussd.uc): a USSD-Notify or a
+		// USSD-Request; for observers only, nothing here acts on it
+		case 'ussd':
+			log('notice', sprintf('modem %s: USSD from the network%s: %s', modem.id,
+				data?.action_required ? ' (asks for a reply)' : '', data?.text ?? '?'));
+			emit('wwand.modem', { modem: modem.id, event: event, ...(data ?? {}) });
+			return;
+
+		// a new SMS (sms_rx.uc). The text goes to the event only: the log
+		// says that one came and from where, not what it says
+		case 'sms':
+			log('notice', sprintf('modem %s: SMS received%s%s', modem.id,
+				data?.sender ? ' from ' + data.sender : '',
+				(data?.index != null) ? sprintf(' (%s %d)', data.storage ?? '?', data.index) : ''));
+			emit('wwand.modem', { modem: modem.id, event: event, ...(data ?? {}) });
+			return;
+
+		// a Cell Broadcast message, new (repeats are dropped by cbs.uc); a
+		// public warning is logged at warn, it is meant to be seen
+		case 'cell_broadcast':
+			log(data?.kind ? 'warn' : 'notice', sprintf('modem %s: cell broadcast %d%s: %s', modem.id,
+				data?.id ?? 0, data?.kind ? sprintf(' (%s %s)', data.kind, data.name ?? '') : '',
+				data?.text ?? '(no text)'));
 			emit('wwand.modem', { modem: modem.id, event: event, ...(data ?? {}) });
 			return;
 		}
@@ -2064,6 +2434,15 @@ export function create(opts)
 			if (entry) {
 				entry._conn_seq = (entry._conn_seq ?? 0) + 1;
 
+				// the device this session's addresses live on (l3_ifindex)
+				entry._up_ifindex = l3_ifindex(entry);
+
+				// a session is up, so whatever throttle was noted is over
+				if (entry.throttle) {
+					log('info', sprintf('interface %s: connected, the APN is no longer held back', name));
+					entry.throttle = null;
+				}
+
 				// and drop the probe in flight, which is asking about the
 				// connection that just ended. Not merely stale — it is IN THE
 				// WAY: the renew further down is how the new session's
@@ -2303,8 +2682,20 @@ export function create(opts)
 			// or a radio cycle runs (with_sessions_released): the modem still
 			// reads READY then, and the failure is the one asked for
 			// (HW-observed on the MeiG SLM770A, 2026-10-10).
-			if (ctx.modem.state == 'READY' && !ctx.modem.detached && !ctx.modem._reattaching)
+			// Nor one the modem refused because it holds the APN back after
+			// network rejections (the context sets err.throttled, context.uc
+			// _fail / callend.throttled): every dial until the
+			// back-off runs out ends the same way, and the ladder's radio cycles
+			// and resets would only add to what the network sees. The time
+			// left comes from the modem where it can say (QMI Get PDN Throttle
+			// Info); the retry waits for it (reconnect.uc retry_activate).
+			let throttled = !!data?.throttled;
+
+			if (ctx.modem.state == 'READY' && !ctx.modem.detached && !ctx.modem._reattaching && !throttled)
 				ctx.modem.note_connect_failure();
+
+			if (throttled && entry)
+				note_throttle(name, entry, ctx);
 
 			// A START_NETWORK the modem never ANSWERS (a timeout, not a refusal)
 			// on a registered modem means its WDS side hangs. An MC7710
@@ -2393,7 +2784,11 @@ export function create(opts)
 			// A modem-level reattach (netsel_ops) stops the sessions before
 			// it detaches and hands them back afterwards — a reconnect started
 			// here would dial into the detach.
-			if (entry?.wanted && !ctx?.modem?._reattaching)
+			// An ICCID-bound interface whose card the modem is leaving or
+			// still reading is not held up and reconnected: that is its own
+			// switch, and the next `registered` brings it up (sim_binding).
+			if (entry?.wanted && !ctx?.modem?._reattaching &&
+			    !(entry.cfg?.iccid && siminventory.norm_iccid(entry.cfg.iccid) != siminventory.norm_iccid(ctx?.modem?.info?.iccid)))
 				enter_reconnecting(name);
 			break;
 
@@ -2424,6 +2819,13 @@ export function create(opts)
 	// for a slower one without leaving a genuinely swapped serial stick
 	// unserved for long.
 	const PPP_SETTLE = 90;
+
+	// How long a QMI/MBIM control device may stand without its network
+	// interface before the modem is started without one. On the T99W175 both
+	// appeared within the same second (mhi-pci-generic, 2026-11-08), so this
+	// is room, not a measurement; past it the waiting tick (waiting_retry,
+	// 30 s) starts the modem the way it always was.
+	const NETDEV_SETTLE = 15;
 
 	// a PPP-only modem (serial port only) is mode-switched ONCE to a richer
 	// usbnet mode, then left for hotplug to rebuild on re-enumeration (no modem
@@ -2606,13 +3008,13 @@ export function create(opts)
 			};
 
 		// TELL THE CONTEXTS FIRST, then stop the modem — the order _device_gone
-		// uses (modem_common.uc:841). Dropping `centry.ctx` below only releases
+		// uses (modem_common.uc:927). Dropping `centry.ctx` below only releases
 		// the daemon's HANDLE: the context object itself lives on with its
 		// monitor timers armed and its WDS clients alive, polling a hub that
 		// entry.modem.stop() has just closed. One orphan per removal, and its
 		// late events can arm a spurious reconnect-hold on the rebuilt entry.
 		// `lost` is built for exactly this — it stops the monitor and destroys
-		// the family clients without attempting QMI cleanup (context.uc:1294).
+		// the family clients without attempting QMI cleanup (context.uc:1333).
 		for (let cname, centry in self.contexts) {
 			if (centry.cfg.modem == name && centry.ctx)
 				centry.ctx.modem_event('lost');
@@ -3000,14 +3402,31 @@ export function create(opts)
 			?? blocked_by_path(cfg, control);
 
 		if (claim) {
-			log('warn', sprintf('modem %s: device %s is owned by interface %s (proto %s) — ignoring this modem',
-				name, claim.device, claim.interface, claim.proto));
+			// Name the way out, not only the owner: a modem parked here looks
+			// idle for no reason unless the note says what would free it. For
+			// the protos the migration knows it is offered CONDITIONALLY:
+			// migrate_plan also needs an identity (no devpath/bus-only claim)
+			// and skips a non-qmi section that already names a modem, so the
+			// note points at the list that shows only what it can convert
+			// rather than repeating those rules here. The hint
+			// names no culprit for HOW the interface got there: the wwan
+			// package's hotplug scripts only mark existing sections available
+			// and never write one (wwan.usb / wwan.usbmisc, openwrt 2026-11), so
+			// it is a board default (board.d 02_network), LuCI or the user.
+			let migratable = (claim.proto == 'qmi' || claim.proto == 'mbim' ||
+			                  claim.proto == 'ncm' || claim.proto == 'modemmanager');
+			let hint = migratable
+				? 'migrate it to proto wwand if the LuCI modem list offers it (/usr/libexec/wwand/migrate shows the same plan), else disable it'
+				: 'disable or remove it to let wwand drive the modem';
+
+			log('warn', sprintf('modem %s: device %s is owned by interface %s (proto %s) — ignoring this modem; %s',
+				name, claim.device, claim.interface, claim.proto, hint));
 
 			self.modems[name] = {
 				cfg: cfg, device: null, netdev: null, muxinfo: muxinfo,
 				l3_name: l3name ?? null, modem: null, protocol: null,
-				control_note: sprintf('device %s is owned by interface %s (proto %s)',
-					claim.device, claim.interface, claim.proto),
+				control_note: sprintf('device %s is owned by interface %s (proto %s) — %s',
+					claim.device, claim.interface, claim.proto, hint),
 				...carry_over(name),
 			};
 
@@ -3080,6 +3499,11 @@ export function create(opts)
 			// exists to provide. A spell ends when the device goes away or
 			// comes back rich, and both clear it.
 			delete entry._ppp_since;
+
+			// ...and a control device that left ends its netdev wait: the
+			// next enumeration gets a window of its own, not one that ran out
+			// while nothing was there
+			delete entry._netdev_since;
 
 			log('warn', sprintf('modem %s: control interface not present yet, waiting for hotplug', name));
 			// surface the wait to status()/netifd; the periodic tick re-logs it every 30s.
@@ -3169,6 +3593,35 @@ export function create(opts)
 
 		if (!entry.netdev && deps.resolve_netdev)
 			entry.netdev = deps.resolve_netdev(cfg, device);
+
+		// THE CONTROL DEVICE CAN COME BEFORE ITS NETWORK INTERFACE. A
+		// PCIe/MHI modem re-enumerating after a reset announces wwan0mbim0
+		// first and its netdev a moment later; started in between, the modem
+		// ran with no datapath netdev, connected its session anyway, and the
+		// netdev that followed kept its kernel name — netifd waited for the
+		// stable one and the interface stayed down until wwand was restarted
+		// (HW-observed on a T99W175 over mhi-pci-generic, 2026-11-08). So a
+		// QMI/MBIM modem without one waits; the netdev's own hotplug add
+		// starts it. BOUNDED, because a modem may really have none (a config
+		// naming a wrong device): after NETDEV_SETTLE the waiting tick starts
+		// it as before. Not for QRTR, whose netdev only ever comes from the
+		// config.
+		if ((proto == 'qmi' || proto == 'mbim') && !entry.netdev && cfg.device != 'qrtr' &&
+		    deps.resolve_netdev) {
+			entry._netdev_since ??= time();
+
+			if ((time() - entry._netdev_since) < NETDEV_SETTLE) {
+				log('info', sprintf('modem %s: control device %s is here, its network interface not yet — waiting for it',
+					name, device));
+				entry.control_note = 'waiting for modem (network interface not present yet)';
+				return;
+			}
+
+			log('warn', sprintf('modem %s: no network interface for %s after %d s — starting without one',
+				name, device, NETDEV_SETTLE));
+		}
+
+		delete entry._netdev_since;
 
 		rename_l3(name, entry);
 
@@ -3384,6 +3837,26 @@ export function create(opts)
 		// on LTE a registration is an attach, the network sees the IMSI. Parked
 		// at init as a plugin park, so the tick wakes it when the hold is gone.
 		entry.modem.radio_hold = () => self.plugins_radio_hold?.(name) ?? null;
+		// The card the bring-up asserts the slot for (sim.uc boot_slot): an
+		// ICCID-bound interface on this modem that is to come up — `auto`
+		// and not taken down by the operator, or in use already. First by name; config.uc
+		// warns when two auto interfaces want different cards.
+		entry.modem.bound_iccid = () => {
+			for (let cn in sort(keys(self.contexts))) {
+				let c = self.contexts[cn];
+				let id = siminventory.norm_iccid(c?.cfg?.iccid);
+
+				// `wanted` is true for every context at build, so the
+				// operator's ifdown is read from its persisted record
+				if (c?.cfg?.modem != name || !id || !c.wanted || self._admin_downs?.[c.cfg.interface])
+					continue;
+
+				if ((c.cfg.auto ?? true) || c._sim_switch || (c.ctx && c.ctx.state != 'IDLE'))
+					return { iccid: id, interface: c.cfg.interface ?? cn };
+			}
+
+			return null;
+		};
 		// A setting the init sequence changed that only a modem reset makes
 		// real (an EFS item is read at boot): reset once. Once per modem and
 		// setting for the daemon's life — should the reset not make it stick,
@@ -3626,11 +4099,15 @@ export function create(opts)
 		// place for the cost of one re-registration, so a restart would drop
 		// the connections for nothing — and the settings editor writes them to
 		// uci on every band edit of a modem that does not keep them itself.
+		// ...and its `pincode`, for SIM_EFFECT's reason: read by the SIM step
+		// only, handed to the running modem in step 4, and a modem at its SIM
+		// step (SIM_UNLOCK, SIM_BLOCKED) is restarted for it in step 1.
 		let modem_sig = (mn) => {
 			let cfg = { ...(parsed.modems[mn] ?? {}) };
 
 			delete cfg.ext;
 			delete cfg.sims;
+			delete cfg.pincode;
 
 			for (let k in BAND_OPTS)
 				delete cfg[k];
@@ -3643,10 +4120,20 @@ export function create(opts)
 		//    changed modem must rebuild its datapath, so its contexts bounce with it.
 		let sims_changed = (mn) =>
 			sprintf('%J', self.modems[mn]?.cfg?.sims) != sprintf('%J', parsed.modems[mn]?.sims);
+		let pin_changed = (mn) =>
+			(self.modems[mn]?.cfg?.pincode ?? '') != (parsed.modems[mn]?.pincode ?? '');
+		// The two states in which a changed PIN or override must restart the
+		// modem: SIM_BLOCKED waits for one, and in SIM_UNLOCK the SIM step has
+		// already taken the old PIN and may be about to enter it — updating
+		// the config in place would let that attempt go out and burn a try.
+		// Before it (INIT_*) the step reads the config handed over in step 4,
+		// after it the PIN is not read again.
+		let at_sim_step = (mn) =>
+			(index([ 'SIM_UNLOCK', 'SIM_BLOCKED' ], self.modems[mn].modem?.state) >= 0);
 
 		for (let mn in keys(self.modems))
 			if (!parsed.modems[mn] || self.modems[mn]._sig != modem_sig(mn) ||
-			    (sims_changed(mn) && self.modems[mn].modem?.state == 'SIM_BLOCKED'))
+			    ((sims_changed(mn) || pin_changed(mn)) && at_sim_step(mn)))
 				stop_modem(mn);
 
 		// 2) stop contexts that are gone or changed on a still-running modem (their
@@ -3721,11 +4208,14 @@ export function create(opts)
 			let m = self.modems[mn].modem;
 			let changed = sims_changed(mn);
 
-			if (self.modems[mn].cfg)
+			if (self.modems[mn].cfg) {
 				self.modems[mn].cfg.sims = parsed.modems[mn]?.sims;
+				self.modems[mn].cfg.pincode = parsed.modems[mn]?.pincode;
+			}
 
 			if (m?.config) {
 				m.config.sims = parsed.modems[mn]?.sims;
+				m.config.pincode = parsed.modems[mn]?.pincode;
 
 				if (changed && (m.info?.iccid != null || m.info?.imsi != null)) {
 					let before = sim_effect(m.active_sim);
@@ -3805,6 +4295,10 @@ export function create(opts)
 					registered: is_registered(reg),
 					radio: on_rat ? radio_ifs[0] : null,
 					lte: lte,
+					// '2g'..'5g' for a `tech` panel (board.uc generation)
+					gen: deps.board?.generation
+						? deps.board.generation({ rat: m?.rat_fine, radio_ifs: radio_ifs, text: rat_txt })
+						: null,
 					roaming: reg?.roaming ?? false,
 					bars: deps.board ? deps.board.bars(m?.signal) : 0,
 				};
@@ -3836,6 +4330,11 @@ export function create(opts)
 				let m = entry?.modem;
 
 				if (!m?.at || m.uim_remote_switch != null || (m._uimrmt_tries ?? 0) >= 3 || m._uimrmt_busy)
+					return;
+
+				// an unanswered version query omitted nothing: only an
+				// allocation could tell whether UIM Remote is there
+				if (entry.protocol == 'qmi' && m.services_unknown)
 					return;
 
 				if (!match(lc(sprintf('%s', m.info?.manufacturer ?? '')), /quectel/))
@@ -4020,9 +4519,14 @@ export function create(opts)
 				// waiting modems: periodically re-check presence and rebuild via
 				// start_modem — recovers modems whose hotplug 'add' never fired.
 				// While still absent, start_modem re-logs the wait.
+				// A netdev wait is retried at its own bound: no further hotplug
+				// is owed when the netdev never comes, and the window would
+				// otherwise last as long as the retry period
 				for (let name, entry in self.modems)
 					if (!entry.modem && entry.control_note &&
-					    (now - (entry._waiting_logged ?? 0)) >= (self.timing?.waiting_retry ?? 30)) {
+					    (now - (entry._waiting_logged ?? 0)) >= (entry._netdev_since != null
+					        ? min(self.timing?.waiting_retry ?? 30, NETDEV_SETTLE)
+					        : (self.timing?.waiting_retry ?? 30))) {
 						start_modem(name, entry.cfg, entry.muxinfo, entry.l3_name);
 
 						if (self.modems[name])
@@ -4236,6 +4740,10 @@ export function create(opts)
 		if (m?.modem?.detached)
 			return cb({ error: 'detached', detail: sprintf('modem %s is detached from the network (wwandctl attach)', entry.cfg.modem) });
 
+		// bound to a card the modem is not running: switch, or say why not
+		if (sim_binding(name, entry, answer))
+			return;
+
 		if (m?.modem?.lowpower_parked && m.modem.set_opmode) {
 			log('notice', sprintf('modem %s: waking the parked radio for %s',
 				entry.cfg.modem, name));
@@ -4365,12 +4873,21 @@ export function create(opts)
 		let name = self.resolve_context(ref);
 		let entry = name ? self.contexts[name] : null;
 
+		// a down ends the card switch an ifup started: left running, the
+		// switch kept holding the modem (siminventory bind_holder) and
+		// refused the other card's interface (HW, NR7101, 2026-11-07)
+		if (entry?._sim_switch) {
+			sim_switch_end(entry);
+			entry.sim_bind = null;
+		}
+
 		// No context to take down — the modem is absent, or the interface's
 		// modem is not configured — but this is still the operator's ifdown
 		// (netifd tears a pending interface down through the shim as well,
-		// proto-ext.c:162-170). Unrecorded, the shim's WAITING_MODEM error
-		// that stays on the interface read as OUR block once the modem came,
-		// and the interface was brought up against them.
+		// proto-ext.c:162-170, netifd 2026.07.08~6088f7b3). Unrecorded, the
+		// shim's WAITING_MODEM error that stays on the interface read as OUR
+		// block once the modem came, and the interface was brought up against
+		// them.
 		if (!entry?.ctx) {
 			// ...unless it is the teardown of a down wwand issued itself (a
 			// hold expiry, a SIM block) that reached us after the modem had
@@ -4535,7 +5052,12 @@ export function create(opts)
 		if (!entry?.ctx)
 			return { error: 'no_such_context', ref: ref };
 
-		return entry.ctx.status();
+		let st = entry.ctx.status();
+
+		if (entry.cfg.iccid && type(st) == 'object')
+			st.sim = self._sim_view(entry);
+
+		return st;
 	};
 
 	self.status = function() {
@@ -4648,7 +5170,7 @@ export function create(opts)
 				// per-slot UICC state, keyed by slot index, as the modem last
 				// said. Event-driven on MBIM; absent elsewhere.
 				slot_state: entry.modem?.slot_state,
-				apdu_backend: entry.modem?._apdu_be,   // mbim | qmi | at (once probed)
+				apdu_backend: entry.modem?._apdu_be,   // mbim | qmi | at | qmi_apdu (once probed)
 				pin1: entry.modem?.pin1,
 				sim_block: entry.modem?.sim_block,  // { reason, retries } when SIM_BLOCKED
 				// card-side diagnostics from the UIM indications: a busy card
@@ -4673,6 +5195,11 @@ export function create(opts)
 				// it is a property of the modem, not of the serving cell, and it
 				// now sits next to the mitigation state it wants to be read with.
 				temperature: entry.modem?.temperature ?? null,
+				// what the modem says about 5G NSA in this cell, and the one
+				// thing holding the link off it, if any (modem_common
+				// collect_nr5g / nr5g_blocker); null on a modem that reports none
+				nr5g: entry.modem?.nr5g_state
+					? { ...entry.modem.nr5g_state, blocker: entry.modem._nr5g_blocker ?? null } : null,
 				// the modem's own thermal mitigation (QMI TMD): which parts of it
 				// are holding back and how far. `mitigated` is the one-bit answer
 				// to "is throughput down because the modem decided so".
@@ -4733,7 +5260,7 @@ export function create(opts)
 				// answers a different structure depending on this one number
 				// (codec/mbim_schema/ms_basic_connect_ext.uc, decode_base_
 				// stations_info). It was agreed once at open and written to a
-				// single log line (mbim_client.uc:207-209), which is nowhere
+				// single log line (mbim_client.uc:293-295), which is nowhere
 				// when you are comparing wwand's reading against mbimcli's an
 				// hour later — and mbimcli opens v1 unless it is given
 				// --device-open-ms-mbimex-v3, so the two talk about different
@@ -4745,7 +5272,7 @@ export function create(opts)
 				// three cases the client cannot tell apart anyway: not an MBIM
 				// modem, the handshake refused, and the handshake not answered
 				// yet — mbim_client keeps 0 for all of the latter
-				// (mbim_client.uc:232). `protocol` separates the first from
+				// (mbim_client.uc:318). `protocol` separates the first from
 				// the other two, and the open-time log line says which of
 				// those two it was. What null must NOT become is "1.0", which
 				// would claim an extension version the modem agreed to.
@@ -4861,6 +5388,9 @@ export function create(opts)
 			contexts[name] = {
 				interface: entry.cfg.interface,
 				modem: entry.cfg.modem,
+				// `option iccid`: the card it needs and where its switch
+				// stands (sim_binding); null for an unbound interface
+				sim: self._sim_view(entry),
 				// what is in force, so it cannot disagree with l3_device on
 				// the next line (a demoted `auto` context reports 0 and the
 				// parent, not channel 1 and a device that does not exist)
@@ -4869,6 +5399,13 @@ export function create(opts)
 				l3_device: derive_netdev(entry),
 				state: entry.ctx?.state ?? 'UNBOUND',
 				last_error: entry.ctx?.last_error,
+				// the modem holds this interface's APN back after network
+				// rejections (note_throttle): { apn, seconds_left } while it
+				// lasts, seconds_left null when the modem gave no time
+				throttle: (entry.throttle && (entry.throttle.until == null || entry.throttle.until > context_common.mono()))
+					? { apn: entry.throttle.apn,
+					    seconds_left: (entry.throttle.until != null) ? entry.throttle.until - context_common.mono() : null }
+					: null,
 				// WHAT THE MODEM HANDED US, which until now existed only in the
 				// `ipv4 config:` line logged once at connect time. That line
 				// rotates away, and two users then had no way to answer the
@@ -4893,12 +5430,14 @@ export function create(opts)
 					gateway: entry.ctx.settings.ipv4.gateway,
 					dns:     entry.ctx.settings.ipv4.dns,
 					mtu:     entry.ctx.settings.ipv4.mtu,
+					pcscf:   entry.ctx.settings.ipv4.pcscf,
 				} : null,
 				ipv6: type(entry.ctx?.settings?.ipv6) == 'object' ? {
 					addr:    entry.ctx.settings.ipv6.addr,
 					plen:    entry.ctx.settings.ipv6.plen,
 					gateway: entry.ctx.settings.ipv6.gateway,
 					dns:     entry.ctx.settings.ipv6.dns,
+					pcscf:   entry.ctx.settings.ipv6.pcscf,
 				} : null,
 			};
 		}
@@ -5050,7 +5589,8 @@ export function create(opts)
 
 	// SIM/SMS/eSIM/APDU + hardware reset/repower ops live in their own modules
 	// (same install pattern); the daemon keeps lifecycle, config and status.
-	simops.install(self, { log: log, check_modem: check_modem, load_esim: load_esim });
+	simops.install(self, { log: log, check_modem: check_modem, load_esim: load_esim,
+	                       store_pincode: deps.store_pincode });
 	hwops.install(self, { log: log, check_modem: check_modem, board: deps.board,
 	                      board_gpio_ok: board_gpio_ok,
 	                      reset_fallback_ms: self.timing?.reset_fallback_ms,
@@ -5497,6 +6037,121 @@ export function create(opts)
 		entry.modem.at.send(command, cb, { timeout: timeout });
 	};
 
+	// RAW MESSAGES, for an operator (`wwandctl qmi` / `wwandctl mbim`): one
+	// request the daemon has no schema or op for, sent on the modem's own
+	// channel, its answer handed back undecoded. Hex in, hex out. Neither
+	// counts toward recovery — an experiment that fails says nothing about
+	// the modem — and neither touches state wwand keeps: what a SET changes
+	// on the modem, wwand learns the way it learns any outside change.
+	let raw_hex = (h) => (type(h ?? '') == 'string' && match(h ?? '', /^([0-9a-fA-F]{2})*$/))
+		? hexmod.hex_to_bin(h ?? '') : null;
+
+	// timeout in ms as given, else 10 s; capped, so a typo cannot leave a
+	// ubus request pending for an hour
+	let raw_timeout = (t) => (t > 0) ? ((t > 120000) ? 120000 : t) : 10000;
+
+	// a = { service: 1..255, message: 0..0xffff, payload: hex TLV bytes,
+	// timeout }. cb(err, { result, error_code, tlvs: [ { type, value } ],
+	// payload, truncated? }) — a QMI failure result is an ANSWER, returned with its
+	// code and TLVs; only no answer at all is an error. The client is a
+	// fresh one of the modem's extra_client, released after the answer, so a
+	// raw request never shares a transaction space with wwand's own clients.
+	// CTL (service 0) is the daemon's: ALLOCATE/RELEASE run there, and a CTL
+	// SYNC resets every client the modem has handed out — over the MBIM
+	// passthrough the live data session with them.
+	self.modem_qmi_raw = function(ref, a, cb) {
+		let entry = check_modem(ref, cb);
+
+		if (!entry)
+			return;
+
+		let svc = a?.service, id = a?.message;
+		let payload = raw_hex(a?.payload);
+
+		if (type(svc) != 'int' || svc < 1 || svc > 255)
+			return cb({ error: 'invalid_service', detail: 'a QMI service id 1..255 (CTL, 0, is the daemon\'s own)' });
+
+		if (type(id) != 'int' || id < 0 || id > 0xffff)
+			return cb({ error: 'invalid_message', detail: 'a QMI message id 0..0xffff' });
+
+		if (payload == null)
+			return cb({ error: 'invalid_payload', detail: 'TLV bytes as hex' });
+
+		let m = entry.modem;
+
+		if (type(m.extra_client) != 'function')
+			return cb({ error: 'unsupported', detail: 'this modem has no QMI channel' });
+
+		m.extra_client({ service: svc, messages: {} }, (err, c) => {
+			if (err)
+				return cb(err);
+
+			c.request_raw(id, payload, (rerr, data, raw) => {
+				// a client the modem's teardown destroyed is released by that
+				// teardown, which pays this callback `cancelled` from inside
+				// its release loop while the client is still on the modem's
+				// list (modem.uc:2067-2077) — a release from here would send
+				// a second RELEASE_CID for the same CID
+				if (!c.destroyed)
+					m.extra_release(c);
+
+				// timeout, send failure, cancelled: nothing came back
+				if (rerr && raw == null)
+					return cb(rerr);
+
+				let tlvs = tlvmod.split(raw);
+				let out = {
+					result: data?._result?.result,
+					// not `error`: the ubus envelope uses that name for
+					// "no answer" (ubus.uc ok_reply)
+					error_code: data?._result?.error,
+					payload: hexmod.bin_to_hex(raw),
+					tlvs: map(tlvs, (t) => ({ type: t.type, value: hexmod.bin_to_hex(t.value) })),
+				};
+
+				if (length(tlvs) && tlvs[length(tlvs) - 1].truncated)
+					out.truncated = true;
+
+				cb(null, out);
+			}, { timeout: raw_timeout(a.timeout), no_recovery: true });
+		});
+	};
+
+	// a = { service: name|uuid, cid, type: 'query'|'set', info: hex,
+	// timeout }. cb(err, { status, status_name, info: hex }); the MBIM modem
+	// does the sending (modem_mbim.uc mbim_raw), because the codec it needs
+	// ships with the MBIM backend, not with this daemon.
+	self.modem_mbim_raw = function(ref, a, cb) {
+		let entry = check_modem(ref, cb);
+
+		if (!entry)
+			return;
+
+		let kind = a?.type ?? 'query';
+		let info = raw_hex(a?.info);
+
+		if (kind != 'query' && kind != 'set')
+			return cb({ error: 'invalid_type', detail: 'query or set' });
+
+		// the wire field is u32, but a ubus integer argument is int32
+		if (type(a?.cid) != 'int' || a.cid < 1 || a.cid > 0x7fffffff)
+			return cb({ error: 'invalid_cid', detail: 'an MBIM command id 1..0x7fffffff' });
+
+		if (info == null)
+			return cb({ error: 'invalid_info', detail: 'InformationBuffer bytes as hex' });
+
+		if (type(entry.modem.mbim_raw) != 'function')
+			return cb({ error: 'unsupported', detail: 'this modem has no MBIM channel' });
+
+		entry.modem.mbim_raw({ service: a.service, cid: a.cid, kind: kind, info: info,
+		                       timeout: raw_timeout(a.timeout) }, (err, res) => {
+			if (err)
+				return cb(err);
+
+			cb(null, { ...res, info: hexmod.bin_to_hex(res.info) });
+		});
+	};
+
 	self.modem_set_protocol = function(ref, target, cb) {
 		let entry = check_modem(ref, cb);
 
@@ -5663,6 +6318,10 @@ export function create(opts)
 			clear_reconnect(name);
 			cancel_confirm(entry);
 		}
+
+		// a watchdog's pending repower fallback is the daemon's own too
+		for (let name, entry in self.modems)
+			entry.modem?.cancel_zero_rx_fallback?.();
 
 		// the loop runs on for the plugins' hand-back (main.uc): nothing of
 		// the daemon's own may act in it — a tick would run the plugins

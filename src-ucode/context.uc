@@ -76,6 +76,11 @@ const PROFILE_FLAGS = [
 	// over the bearer afterwards
 	{ key: 'address_allocation', opt: 'address_allocation', label: 'address allocation',
 	  map: { nas: 0, dhcp: 1 } },
+	// an IMS PDN (`option ims`): P-CSCF in the PCO and the IM CN flag, both
+	// stored profile settings (0x1F / 0x22, libqmi 1.38). wwand only carries
+	// the PDN; whoever speaks IMS on it reads the P-CSCF from the status.
+	{ key: 'pcscf_pco', opt: 'ims', label: 'P-CSCF via PCO' },
+	{ key: 'imcn', opt: 'ims', label: 'IM CN flag' },
 ];
 
 // The same three PDP types as PDP_MAP, spelled the way 3GPP TS 27.007 AT+CGDCONT
@@ -116,6 +121,7 @@ export function create(opts)
 	// context rebuild a modem crash triggers. { refused?: bool, fails?: int }
 	let v6state = opts.v6state ?? {};
 	let v6_hint_given = false;   // pdp_type hint on an IPv6 refusal, once (activate)
+	let v4_hint_given = false;   // the same for an IPv4 refusal
 	let log = deps.log ?? ((level, msg) => warn(sprintf('%s: interface %s: %s\n', level, self.name, msg)));
 
 	// log an assigned family IP config at 'notice' only the FIRST time (at
@@ -174,6 +180,15 @@ export function create(opts)
 		fetch: (family, done) => fetch_settings(family, done),
 	});
 
+	// IPv4 through the modem's CLAT on an IPv6-only connection (`option clat`
+	// on, `pdp_type ipv6`). The ONE IPv4 that is not fatal: the interface is
+	// the IPv6 one, and a modem or network that gives no translated address
+	// leaves it IPv6-only rather than down — which is what it was before
+	// this IPv4 was asked for at all. The other way round it is: the
+	// translated address rides the IPv6 PDN, so an IPv6 that fails fails the
+	// interface, and never leaves it up on the 192.0.0.x alone.
+	let clat_v4 = () => context_common.effective_pdp(self) == 'ipv6' && self.config?.clat === true;
+
 	let wanted_families = () => {
 		let pdp = context_common.effective_pdp(self);
 		let fams = [];
@@ -183,6 +198,15 @@ export function create(opts)
 
 		if ((pdp == 'ipv6' || pdp == 'ipv4v6') && !v6state.refused)
 			push(fams, 6);
+
+		// the modem's own CLAT is used only by an IPv4 start: on an
+		// IPv6-only bearer it answers one with an address of its own
+		// (192.0.0.x, RFC 7335) and translates (stock RIL:
+		// docs/design/stock-ril-observations.md §3; RG500Q-EA,
+		// ddimension/wwand#89). AFTER IPv6, and see clat_v4() for why its
+		// failure is not the interface's.
+		if (clat_v4())
+			push(fams, 4);
 
 		return fams;
 	};
@@ -578,7 +602,11 @@ export function create(opts)
 			// a profile flag (PROFILE_FLAGS) written only at dial time reaches
 			// the network at the NEXT attach. Written here it rides the
 			// re-attach this function already triggers.
-			let flags = init ? [] : filter(flags_wanted(), (f) => data[f.key] !== f.want);
+			// never the IMS flags: the attach bearer is the data PDN, and an
+			// `ims` interface that ends up owning the attach must not mark it
+			// as the IM CN one
+			let flags = init ? [] : filter(flags_wanted(), (f) => data[f.key] !== f.want &&
+				f.key != 'pcscf_pco' && f.key != 'imcn');
 
 			if (!need_apn && !need_pdp && !need_auth && !length(flags)) {
 				log('debug', sprintf('attach profile %d up to date (apn %J pdp %J)',
@@ -855,7 +883,7 @@ export function create(opts)
 						// which asks the client, not the handle.
 						//
 						// The error still ticks the proto-error counter on its way
-						// here (client.uc:184 — no `no_recovery` on the dial, and
+						// here (client.uc:208 — no `no_recovery` on the dial, and
 						// there must not be: a dial that genuinely fails has to
 						// climb). That is deliberate and harmless: the very next
 						// successful request zeroes it (recovery.uc:718-719), and
@@ -966,10 +994,22 @@ export function create(opts)
 		let fam = self.families[sprintf('%d', family)];
 
 		fam.client.request('GET_CURRENT_SETTINGS', {
-			requested: wdsmod.REQ_SETTINGS_DEFAULT,
+			requested: wdsmod.REQ_SETTINGS_DEFAULT | (self.config.ims ? wdsmod.REQ_SETTINGS_PCSCF : 0),
 		}, (err, data) => {
 			if (err)
 				return done({ stage: 'settings', err: err });
+
+			// IMS PDN: the P-CSCF addresses from the PCO, IPv4 (0x23) and
+			// IPv6 (0x2E) lists, whichever the network sent
+			let pcscf = null;
+			if (self.config.ims) {
+				pcscf = [];
+				for (let l in [ data.pcscf, data.pcscf6 ])
+					if (type(l) == 'array')
+						push(pcscf, ...l);
+				if (!length(pcscf))
+					pcscf = null;
+			}
 
 			if (family == 4) {
 				// always /32 point-to-point (old behavior) unless the pushed
@@ -988,6 +1028,9 @@ export function create(opts)
 					mtu: data.mtu,
 				};
 
+				if (pcscf)
+					fam.settings.pcscf = pcscf;
+
 				log_family_config(fam, sprintf('ipv4 config: %s/%d gw %s dns [%s] mtu %J',
 					fam.settings.addr, fam.settings.prefix, fam.settings.gateway,
 					join(' ', fam.settings.dns), fam.settings.mtu));
@@ -1001,6 +1044,9 @@ export function create(opts)
 					dns: filter([ data.ipv6_dns1, data.ipv6_dns2 ], (d) => d != null),
 					mtu: data.mtu,
 				};
+
+				if (pcscf)
+					fam.settings.pcscf = pcscf;
 
 				log_family_config(fam, sprintf('ipv6 config: %s/%d gw %s dns [%s] mtu %J',
 					fam.settings.addr, fam.settings.plen, fam.settings.gateway,
@@ -1104,8 +1150,11 @@ export function create(opts)
 					if (err) {
 						release_family(family);
 
-						// stale-PDP reclaim (see is_stale_pdp above), once per family
-						if (is_stale_pdp(err) && !reclaimed[family]) {
+						// stale-PDP reclaim (see is_stale_pdp above), once per
+						// family — never for the CLAT IPv4: it starts on the
+						// profile the IPv6 it depends on is already up on, and
+						// CGACT=0 takes the whole PDP down, that IPv6 with it
+						if (is_stale_pdp(err) && !reclaimed[family] && !(family == 4 && clat_v4())) {
 							reclaimed[family] = true;
 							return reclaim_stale_pdp(profile, () => {
 								if (gen != up_gen || self.state != 'ACTIVATING')
@@ -1116,8 +1165,17 @@ export function create(opts)
 							});
 						}
 
-						// preserved: v4 fatal, v6 degrades
-						if (family == 4 || !got_any && idx >= length(fams))
+						// preserved: v4 fatal (but the CLAT one, see clat_v4),
+						// v6 degrades while something is left to try — but not
+						// under the CLAT one, which is nothing without it. And
+						// the network's explicit "no IPv4 here"
+						// (callend.ipv4_refused) with v6 still to come degrades
+						// as well: an IPv6-only APN (an IMS PDN, typically)
+						// dialled ipv4v6 would otherwise never come up at all
+						let v4_degrades = (family == 4 && idx < length(fams) &&
+							callend.ipv4_refused(err?.verbose));
+						if ((family == 4 && !clat_v4() && !v4_degrades) || (family == 6 && clat_v4()) ||
+						    !got_any && idx >= length(fams))
 							return self._fail(err);
 
 						// Stop re-attempting IPv6 once it is clearly unavailable here. Some
@@ -1130,7 +1188,14 @@ export function create(opts)
 						// state lives on the daemon entry (v6state), so it outlives the
 						// rebuild; a dual-stack carrier's v6 succeeds and resets it below, so
 						// it never pins; a SIM swap / reboot / ifdown-ifup re-probes v6.
-						if (family == 6 && (err?.verbose?.reason == 210 ||
+						//
+						// The refusal test is callend.ipv6_refused(), not a bare
+						// `reason == 210`: it is TYPED (internal 210, or 3GPP SM
+						// cause 50 under type 6), and callend.uc warns that the
+						// same number under another type means something else -
+						// so the bare check could pin v6 off on an unrelated
+						// failure.
+						if (family == 6 && (callend.ipv6_refused(err?.verbose) ||
 						    (v6state.fails = (v6state.fails ?? 0) + 1) >= 2))
 							v6state.refused = true;
 
@@ -1149,6 +1214,11 @@ export function create(opts)
 						if (family == 6 && !v6_hint_given && callend.ipv6_refused(err?.verbose)) {
 							v6_hint_given = true;
 							log('notice', sprintf('the network refuses IPv6 here (%s) — if that is permanent, set option pdp_type \'ipv4\' on this interface, or in the SIM\'s wwand_sim section if only this card is affected',
+								cdesc?.text ?? 'refused'));
+						}
+						if (v4_degrades && !v4_hint_given) {
+							v4_hint_given = true;
+							log('notice', sprintf('the network refuses IPv4 here (%s) — continuing on IPv6; if that is permanent, set option pdp_type \'ipv6\' on this interface',
 								cdesc?.text ?? 'refused'));
 						}
 
@@ -1173,10 +1243,10 @@ export function create(opts)
 							// 'ipv6'` context whose settings read failed
 							// reached CONNECTED with no families, no settings
 							// and a monitor that never re-arms
-							// (its settings refresh returns at context_monitor_qmi.uc:299-300 on an
+							// (its settings refresh returns at context_monitor_qmi.uc:290-291 on an
 							// empty family set), and sat there until
 							// an operator ifdown.
-							if (family == 4 ||
+							if ((family == 4 && !clat_v4()) || (family == 6 && clat_v4()) ||
 							    (!length(keys(self.families)) && idx >= length(fams)))
 								return self._fail(serr);
 
@@ -1254,6 +1324,11 @@ export function create(opts)
 		// without it every failure shows up as "connection failed: unknown"
 		if (err != null && err.error == null)
 			err.error = desc?.text ?? sprintf('%s failed', err.stage ?? 'activation');
+
+		// a dial the modem refused as throttled: the daemon keeps it off the
+		// recovery ladder and waits out the back-off (daemon.uc note_throttle)
+		if (err != null && callend.throttled(err.verbose))
+			err.throttled = true;
 
 		self.last_error = {
 			stage: err?.stage,

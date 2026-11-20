@@ -16,7 +16,6 @@
 'use strict';
 
 import * as uloop from 'uloop';
-import * as fs from 'fs';
 import * as tlv from 'wwand.codec.tlv';
 import * as qmi_backend from 'wwand.qmi_backend';
 import * as context_common from 'wwand.context_common';
@@ -30,7 +29,7 @@ export function install(self, o)
 	// (refresh_settings / schedule_settings_poll declared in the moved block)
 
 	// zero-rx watchdog (preserved: packet statistics sampled every 60s; no
-	// received packets for zero_rx_timeout -> usb-repower via the modem). The
+	// received packets for zero_rx_timeout -> the modem's recovery). The
 	// stall accumulator + threshold live in context_common (shared with the
 	// MBIM/NCM contexts); this context only feeds it its rx-packet total.
 	let stats_timer = null;
@@ -40,8 +39,8 @@ export function install(self, o)
 	// self.down() stops the monitor and only THEN releases the WDS clients, so
 	// that callback lands on a live client with the context already IDLE. It
 	// would feed the zero-rx watchdog, and a trip there does not just log — it
-	// reaches trip_zero_rx -> recovery.usb_repower(), i.e. a board power-cycle
-	// or a reset-GPIO pulse on a modem that is no longer carrying this context
+	// reaches trip_zero_rx -> a modem reset, and behind it a board power-cycle
+	// or a reset-GPIO pulse, on a modem that is no longer carrying this context
 	// and may well be carrying another one.
 	let stats_gen = 0;
 	// which counter source this connection settled on — see the latch in
@@ -227,18 +226,10 @@ export function install(self, o)
 						? (self.config.mux_link ?? (parent ? sprintf('%sm%d', parent, mux) : null))
 						: parent;
 
-					if (dev && fs.access('/sys/class/net/' + dev)) {
-						let g = (f) => +(trim(fs.readfile(sprintf('/sys/class/net/%s/statistics/%s', dev, f)) ?? '') || 0);
+					let nd = context_common.netdev_stats(dev);
 
-						agg.tx_bytes   = g('tx_bytes');
-						agg.rx_bytes   = g('rx_bytes');
-						agg.tx_packets = g('tx_packets');
-						agg.rx_packets = g('rx_packets');
-						agg.tx_errors  = g('tx_errors');
-						agg.rx_errors  = g('rx_errors');
-						agg.tx_dropped = g('tx_dropped');
-						agg.rx_dropped = g('rx_dropped');
-						agg.source = 'netdev';
+					if (nd) {
+						agg = nd;
 
 						if (stats_src == null && (agg.rx_packets || agg.tx_packets))
 							stats_src = 'netdev';

@@ -26,13 +26,15 @@ the vendor/interface survey behind this.
 
 ## 1. Measured baseline (Chateau)
 
-One process. Zero per-context spawns. ~3 MB resident. The measured baseline:
+One process. Zero per-context spawns. ~5 MB resident as bytecode. The measured
+baseline (RSS: Zyxel NR7101, mips, one QMI modem, 2026-11-16; the rest from the
+first Chateau measurement, when the tree was much smaller):
 
 | Metric | Value | Context |
 |---|---|---|
-| Daemon RSS | **~2.9 MB** | ModemManager + libqmi + glib: typically 15–30 MB |
+| Daemon RSS | **5.1 MB** bytecode, 10.8 MB source | the same tree both ways; ModemManager + libqmi + glib: typically 15–30 MB |
 | Open fds | 36 | cdc-wdm, tty, ubus, uloop; watched for leaks in soak tests |
-| ucode sources | 196 KB uncompressed | ≈ 40–50 KB on squashfs |
+| ucode tree | 2.9 MB source, 1.7 MB bytecode (2026-11-16) | was 196 KB at the first measurement; the RSS grew with it |
 | Native module | ~68 KB stripped | I/O + rmnet netlink helper |
 | Processes | **1 daemon, 0 per context** | no per-interface supervisor (no-proto-task) |
 | External spawns at runtime | 0 | only reboot in recovery (repower is a board GPIO) |
@@ -44,26 +46,34 @@ One process. Zero per-context spawns. ~3 MB resident. The measured baseline:
                                    (protocol-agnostic), rmnet netlink helper
  codec:        qmux.uc, tlv.uc, hex.uc, schema/*.uc  — QMI, declarative
                schema: ctl/dms/nas/wds/wda/uim/wms/loc/dsd/rat + pdc (carrier
-               config), tmd (thermal mitigation), cat (SIM toolkit)
-               mbim.uc, mbim_schema/*.uc             — MBIM, declarative
+               config), tmd (thermal mitigation), cat (SIM toolkit), voice
+               (wms/voice loaded lazily via *_lazy.uc)
+               mbim.uc, mbim_schema/*.uc             — MBIM, declarative:
+               basic_connect, ms_basic_connect_ext, ms_voice_ext,
+               qmi_passthrough + vendor quectel/compal/fibocom
  session:      transport.uc (hub/routing), client.uc (QMI correlation),
                mbim_client.uc, qmi_over_mbim.uc (QMI-over-MBIM passthrough hub),
                qmi_over_qrtr.uc (QMI over the QRTR bus: CTL emulated, one
                socket per client)
  backends:     QMI  — modem.uc/context.uc + extracted helpers modem_init_qmi.uc,
-                      telemetry_qmi.uc, datapath_qmi.uc, context_monitor_qmi.uc,
+                      telemetry_qmi.uc, modem_datapath_qmi.uc, context_monitor_qmi.uc,
                       regdetail.uc, config_check.uc
                MBIM — modem_mbim/context_mbim + telemetry_mbim.uc
                NCM  — modem_ncm/context_ncm + telemetry_ncm.uc (NCM/AT)
                one daemon-neutral contract; shared core:
                       modem_common.uc, context_common.uc, backend.uc,
-                      qmi_backend.uc, mbim_backend.uc, sim.uc
+                      qmi_backend.uc, mbim_backend.uc, sim.uc;
+               services over any backend: ussd.uc, sms_rx.uc (inbound SMS),
+                      cbs.uc (cell broadcast), cell_lock.uc (lock_4g/lock_5g)
  system:       netlink.uc (datapath), recovery.uc, board.uc (power/reset/LEDs),
                carrier_config.uc (MBN selection over PDC — token/indication),
                atcmd.uc + atcmd_parse.uc (+atport),
                discovery.uc (control-type detection), modeswitch/protocol_switch
  integration:  daemon.uc + netsel_ops.uc (registry/policy), config.uc
-               (+migrate/compat), ubus.uc, main.uc
+               (+migrate/compat), ubus.uc, main.uc, simops.uc (SIM/SMS/
+               eSIM/APDU/PLMN ops), hwops.uc (reset/repower), deps.uc (side
+               effects: uci, netifd over ubus, emit_event → /etc/hotplug.d/
+               wwand scripts via hotplug_env), plugins.uc (plugin hooks)
  shell:        wwand-proto.sh (thin netifd shim → wwand.sh, proto `wwand` only), init, hotplug,
                wwand-migrate + an example uci-defaults script (user-triggered config migration)
 ```
@@ -178,6 +188,9 @@ Design principles, all validated in the field:
 
 Bring-up is a linear step chain per modem; any step failure tears down and
 schedules a capped-backoff retry that climbs the recovery ladder (§ Recovery).
+The QMI chain is drawn; `VERIFY_ONLINE` and `FCC_AUTH` are step functions inside
+`SET_OPMODE`, not states — `status` never shows them (`modem_common.MODEM_STATES`
+holds the names it can show).
 
 ```
   ABSENT
@@ -236,9 +249,10 @@ mux links → parent MTU = negotiated aggregation size + 4 → children up.
 rmnet links are created through the native helper including
 `IFLA_RMNET_FLAGS` (ingress deaggregation is mandatory; MAPv5 checksum
 offload flags are set only when the modem confirms v5 — the RG650E declines
-it on USB). Aggregation size comes from a model table (e.g. RG650E 31 KB),
-then a board table, config override wins; the modem clamps the request and
-the echoed value drives the driver side.
+it on USB). The aggregation size asked for is 31 KB on every modem (config
+override wins); the modem clamps the request and the echoed value drives the
+driver side. A vendor driver whose buffer is fixed at load reports it as
+`dgram_max`, and the request is capped there.
 
 **Bidirectional aggregation, endpoint typing & client type.** `SET_DATA_FORMAT`
 negotiates **uplink** QMAP aggregation as well as downlink — `ul_max_datagrams`
@@ -295,7 +309,7 @@ the datapath:
   keeps its kernel name and is never renamed.
 
 On `registered` the daemon writes the resolved name back onto the interface
-section as `option device` (`main.uc` `learn_device`): idempotent, `commit`-only
+section as `option device` (`deps.uc` `learn_device`): idempotent, `commit`-only
 so no interface bounce, and it **never clobbers a user-set value** — gated by
 `wwand_globals.write_device` (default on). That gives VRF `list ports`, firewall
 and LuCI one explicit, editable, stable handle onto the datapath.
@@ -451,12 +465,15 @@ cycle, 16 → modem offline/reset, 24 → **hardware repower** — a modem/board
 (replacing the old external `usb-repower` tool) — > `failreboot` → system
 reboot. QMI request errors have a separate ceiling (25 → reboot). Counters
 persist in tmpfs across daemon restarts and are intentionally cleared by
-reboot. A zero-rx watchdog (packet stats delta) triggers the hardware repower
-where the board **can** repower; on a self-powered PCIe/MHI modem with no
-repower mechanism it falls through to a **modem reset** instead (the repower
-would be a no-op, and the reset is what clears a bearer stalled with QMI still
-reporting it CONNECTED). The watchdog asks `recovery.can_repower()` to tell the
-two apart, and the reset keeps the ladder's evidence rule (never a modem that
+reboot. A zero-rx watchdog (packet stats delta, or the daemon's TX-stall watch)
+**resets the modem**, soft first like `modem_reset` below: a reset-line pulse
+or a power cut stops the modem mid-write, and on a stalled data path the
+control channel usually still answers (#76). The board's hardware repower is
+the fallback — at once when the reset is refused, or when the modem is still on
+the bus `reset_fallback` seconds (default 30) after acknowledging it; a backend
+with no reset of its own goes to the board directly. `recovery.can_repower()`
+tells "no repower mechanism" (a self-powered PCIe/MHI modem: the reset alone)
+from "refused". The reset keeps the ladder's evidence rule (never a modem that
 has not answered) plus a per-modem latch so two stalled contexts reset once.
 
 Alongside the automatic ladder, the `modem_reset` ubus method
@@ -481,7 +498,8 @@ Port discovery: config override → board quirk table → USB id + interface
 number lookup in a table generated from ModemManager's udev rules (225
 devices; lazily loaded) → first-tty heuristic. Serialized command engine
 with echo filtering and OK/ERROR/+CME parsing. Used for model init quirks
-(Quectel MBN autoselect — a QMI-native PDC replacement is a future option),
+(Quectel MBN autoselect; the QMI-native path is `carrier_config.uc`, MBN
+selection over PDC),
 cell locking, the Huawei mode fallback, and ad-hoc diagnostics via ubus.
 Connection bring-up never depends on AT.
 
@@ -492,11 +510,9 @@ loop, the zero-rx watchdog) has been consolidated into `modem_common.uc` /
 `context_common.uc`; the remaining fork between the three backends is genuine
 per-protocol logic (step chains, teardown, `with_nas`). Open items:
 
-1. A ~25-line `series()` helper would flatten the deeper callback chains
-   (`_read_info`, sim flows).
-2. Error objects are ad hoc; an `errors.uc` with constants and a QMI
+1. Error objects are ad hoc; an `errors.uc` with constants and a QMI
    error-code name table would improve logs and grep-ability.
-3. Recovery persistence writes on every counter change; a dirty-flag with a
+2. Recovery persistence writes on every counter change; a dirty-flag with a
    1 s timer would throttle failure storms (tmpfs, so hygiene only).
 
 (The old per-interface shell monitor is gone — the no-proto-task model in §3
@@ -510,9 +526,10 @@ above cares which one is in use.
 
 ```
               ┌──────────── daemon-neutral contract ─────────────┐
-              │ modem: start/stop/state/with_nas/attach_context/ │
-              │        note_connect_*/switch_protocol + events    │
-              │ context settings: {ipv4{…}, ipv6{…}, mtu}         │
+              │ modem: duck-typed fields (spec: backend.uc:20-38)│
+              │  (id/state/config/info/reg/active_sim/at/timing/ │
+              │   contexts, scaffolding, reset, reapply_sim)     │
+              │ context settings: {ipv4{…}, ipv6{…}, mtu}        │
               └──────────────────────────────────────────────────┘
                    │                  │                    │
                ┌───┴───┐         ┌────┴────┐          ┌────┴───┐
@@ -600,7 +617,10 @@ The **APDU transport** is chosen per modem (`sim.uc apdu_backend`): native
 **MBIM MS UICC Low Level Access** → **QMI UIM** (native or over the
 QMI-over-MBIM passthrough) → **AT** (`CCHO`/`CGLA`/`CCHC` — the path for
 AT-only modems like the Fibocom FM350-GL, whose T700 answers `CCHO` with a
-bare session id). On dual-SIM modules the eUICC is its own physical slot; the
+bare session id) → **QMI `SEND_APDU` alone** (`qmi_apdu`: the channel opened,
+selected and closed by hand with MANAGE CHANNEL and SELECT by AID, its number
+in the CLA byte — for a firmware whose UIM service has no logical channel
+message, like the Huawei E392). On dual-SIM modules the eUICC is its own physical slot; the
 internal LPA re-claims the ISD-R, so host APDU access is a **window** that
 opens after a slot switch — wwand re-probes the backend per operation instead
 of caching a dead channel, and the modem's `esim_ready` event (fired after the
@@ -810,5 +830,6 @@ four `err 48` warnings per LuCI status poll.
 ## 9. Roadmap
 
 1. Byte-trace captures from real modems as codec regression fixtures.
-2. QMI-native cell-lock / PDC (replacing the AT `QNWLOCK` / `QMBNCFG` quirks).
+2. QMI-native PDC (replacing the AT `QMBNCFG` quirk). Cell locks have a QMI
+   dialect since 2026-11-17 (`cell_lock.uc`).
 3. Wider modem coverage in the quirk tables (see `docs/extending.md`).

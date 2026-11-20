@@ -25,7 +25,8 @@ message-oriented cdc-wdm/tty I/O + rmnet netlink helper;
   the separate `ucode-mod-wwand-io` package is gone, `PROVIDES` covers old
   configs), `wwand-qmi`, `wwand-mbim` (DEPENDS wwand-qmi), `wwand-ncm`,
   `wwand-mhi` (PCIe/MHI transport + MHI kmods + the wwan-subsystem hotplug;
-  backend-neutral, pair with wwand-qmi/-mbim), `wwand-esim`, plus two optional
+  backend-neutral, pair with wwand-qmi/-mbim), `wwand-esim`, `wwand-gps` (NMEA
+  reader, `modem_gps`), `wwand-apntest` (APN test runner), plus two optional
   DATAPATH add-ons — `wwand-datapath-rmnet_nss` (vendor `qmi_wwan_q`, USB) and
   `wwand-datapath-rmnet_nss_mhi` (vendor `pcie_mhi`, PCIe/MHI) — which adopt the
   QMAP children those drivers register so Qualcomm NSS offload survives.
@@ -42,13 +43,16 @@ message-oriented cdc-wdm/tty I/O + rmnet netlink helper;
   configure-time capability probe checks the host ucode can actually emit a
   bytecode module with these flags — an older/absent ucode DOES NOT fail the
   build, it ships the ucode SOURCE instead (functional, no bytecode start-up
-  win). That is not hypothetical and not a defect: **openwrt-25.12 ships source,
-  snapshot ships bytecode**, because 25.12's ucode (2026.01.16) does not know
-  `-cmodule` at all — it ignores the flag, compiles the file as a program, and
-  `export` is illegal there. Nor is there a way around it: that interpreter
-  cannot even LOAD a bytecode module (it reads the file as source and stops at
-  the magic), so producing them elsewhere does not help. It flips by itself once
-  the branch carries a newer ucode. Note the coupling is to the ucode VERSION,
+  win). That is not hypothetical and not a defect: ucode 2026.01.16 (the
+  openwrt-25.12 images up to 25.12.6) does not know `-cmodule` at all — it
+  ignores the flag, compiles the file as a program, and `export` is illegal
+  there. Nor is there a way around it: that interpreter cannot even LOAD a
+  bytecode module (it reads the file as source and stops at the magic), so
+  producing them elsewhere does not help. The 25.12 branch moved to ucode
+  2026.07.09 on 2026-11-11 and its package repository serves it to 25.12.x
+  routers, so 25.12 builds since then ship bytecode too, depending on
+  `ucode >= 2026.07.09` (feed stable 1.8.0 for 25.12, built before, is source;
+  memory: 5.1 MB RSS as bytecode vs 10.8 MB as source, README). Note the coupling is to the ucode VERSION,
   not the target: bytecode is architecture-independent (a module from the
   aarch64 package loads in an x86-64 interpreter). Dev opt-out:
   `CONFIG_WWAND_UCODE_SOURCE` (feed menuconfig) / `-DUCODE_PRECOMPILE=OFF`.
@@ -113,7 +117,7 @@ incl. `schema/rat.uc` = canonical RAT/IoT vocabulary, `mbim*.uc`) → session
 (`transport.uc`, `client.uc`; further hubs under the same contract:
 `qmi_over_mbim.uc`, `qmi_over_qrtr.uc`) → state machines
 (`modem.uc` + its extracted QMI helpers `modem_init_qmi.uc` / `telemetry_qmi.uc`
-/ `regdetail.uc` / `config_check.uc` / `datapath_qmi.uc`; the datapath
+/ `regdetail.uc` / `config_check.uc` / `modem_datapath_qmi.uc`; the datapath
 interface lives in `netlink.uc` with `datapath_*.uc` add-ons beside it
 (docs/datapath-interface.md); `modem_mbim.uc` +
 `telemetry_mbim.uc`; `modem_ncm.uc` + `ncm_vendors.uc` (vendor dial/auth tables)
@@ -126,7 +130,8 @@ datapath, `recovery.uc`, `atcmd.uc` + `atcmd_parse.uc`, `board.uc`) → integrat
 
 ## Board / power / LEDs (`board.uc`)
 Generic, keyed off `/etc/board.json` model id → a profile table (MikroTik
-Chateau, Zyxel LTE33xx/NR7101; unknown = null profile → all ops no-op). Absorbs
+Chateau, Zyxel LTE3301/LTE5398/NR7101, Cudy LT300, Huasifei WH3000 Pro,
+Arcadyan AW1000; unknown = null profile → all ops no-op). Absorbs
 the vendor helper scripts: modem power/reset GPIOs + status LEDs. Wired in:
 recovery `usb_repower` rung → board **power-cycle or reset-GPIO pulse** (replaces
 the external `usb-repower`); a modem config `reset_gpio` (or the board default)
@@ -138,7 +143,11 @@ LuCI button. Everything through an injectable `fx` → `test_board.uc`.
 `_apdu_be` probe order (sim.uc `apdu_backend`): **native MBIM MS UICC Low Level
 Access** (`mbim_backend.uicc_*`, UUID `c2f6588e…`, via `command_raw`) → **QMI
 UIM logical channel** (native, or over the QMI-over-MBIM passthrough via
-`modem_mbim._ensure_uim`) → **AT** (`CCHO`/`CGLA`). `sim.power_cycle`
+`modem_mbim._ensure_uim`) → **AT** (`CCHO`/`CGLA`) → **`qmi_apdu`** (QMI
+`SEND_APDU` alone; MANAGE CHANNEL / SELECT by AID by hand, the channel in the
+CLA — Huawei E392, whose UIM has no logical channel message; also what a real,
+non-discovery open falls back to when an AT port that never opened a channel
+refuses it, since the AT probe is only "is there a port"). `sim.power_cycle`
 deliberately uses the OPPOSITE precedence (QMI-UIM first — the HW-proven SIM
 hot-reset — then MBIM UICC Reset, then AT CFUN=0/1); see the comments at both
 sites. MBIM modem exposes `self.mbim_uicc` (duck-typed; keeps the
@@ -173,6 +182,12 @@ be decided by load order; `_wwand_apply_settings` builds the netifd update).
   `/vol/release/chateau/openwrt/build_dir/.../libqmi-1.38.0/data/qmi-service-*.json`
   (request TLVs vs `input`, response vs `output`, resolve `common-ref` ids).
   A wrong tag silently decodes garbage (e.g. the packet-dropped 0x1D/0x1E fix).
+  libqmi first is a recommendation (since 2026-11-15), not an exclusion: where
+  libqmi lacks a message or TLV, a vendor IDL table (a shipping RIL's
+  `libqmiservices.so`, decoded with wwand-ims `tools/qmi-idl-dump.py`), Qualcomm
+  sources, the Gobi API or the kernel may supply it — named in the schema
+  comment, measured on hardware before it is sent or relied on, and listed in
+  `docs/qmi-beyond-libqmi.md` (rerun wwand-ims `tools/qmi-libqmi-audit.sh`).
 - **Kernel behaviour must be verified against the kernel source**, the same way
   QMI schemas are verified against libqmi. The tree is at
   `/vol/release/chateau/openwrt/build_dir/target-*/linux-*/linux-*/drivers/`.
@@ -384,4 +399,4 @@ Modem is normally in **QMI mode**
   (libqmi QMI_WDA_DATA_AGGREGATION_PROTOCOL_QMAPV4 = 0x08; v5 is 0x09, and
   quectel-cm only ever sends 0x05 or 0x09). `DAP_QMAPV5` was 8 and is 9 now, so
   the renegotiation that used to fire here should stop. Re-verify on HW;
-  `dl_datagram_max_size` (default model table = 31 KB) is overridable per modem.
+  `dl_datagram_max_size` (default 31744 for every modem, negotiated) is overridable per modem.

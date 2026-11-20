@@ -332,6 +332,42 @@ eq(atcmd.cell_lock_commands({}), [], 'lock: nothing configured');
 	eq(length(atcmd.sim_detect_commands({}, { sim_detect: 'high' })), 1,
 		'simdet: a manufacturer not known yet is no reason to skip');
 }
+// 5G NR mode (#75): the Android NSA/SA split as a vendor AT setting. Both
+// dialects number it 0 both / 1 NSA only / 2 SA only
+{
+	let fox = { model: 'QUALCOMM INCORPORATED', firmware: 'T99W175.F0.1.0.0.9.SC.005' };
+	let st = atcmd.nr5g_mode_commands(fox, { nr5g_mode: 'both' });
+
+	eq(atcmd.nr5g_dialect(fox), 'foxconn', 'nr5g: a T99W175 is known by its MBIM firmware string');
+	eq([ st[0]?.check, st[0]?.set ], [ 'AT^NR5G_MODE?', 'AT^NR5G_MODE=0' ], 'nr5g: foxconn both = 0');
+	ok(match('^NR5G_MODE:0', regexp(st[0].want)) && !match('^NR5G_MODE:1', regexp(st[0].want)),
+		'nr5g: foxconn: the held value is recognised (no space after the colon), another is not');
+	eq(atcmd.nr5g_mode_commands(fox, { nr5g_mode: 'nsa' })[0].set, 'AT^NR5G_MODE=1', 'nr5g: foxconn nsa = 1');
+	eq(atcmd.nr5g_mode_commands(fox, { nr5g_mode: 'sa' })[0].set, 'AT^NR5G_MODE=2', 'nr5g: foxconn sa = 2');
+
+	let q = { manufacturer: 'Quectel', model: 'RG502Q-EA' };
+	st = atcmd.nr5g_mode_commands(q, { nr5g_mode: 'nsa' });
+	eq([ st[0]?.check, st[0]?.set ], [ 'AT+QNWPREFCFG="nr5g_disable_mode"', 'AT+QNWPREFCFG="nr5g_disable_mode",1' ],
+		'nr5g: quectel nsa = disable SA (1)');
+	ok(match('+QNWPREFCFG: "nr5g_disable_mode",1', regexp(st[0].want)) &&
+	   !match('+QNWPREFCFG: "nr5g_disable_mode",12', regexp(st[0].want)),
+		'nr5g: quectel: the held value is recognised, a longer number is not');
+	eq(atcmd.nr5g_mode_commands(q, { nr5g_mode: 'sa' })[0].set, 'AT+QNWPREFCFG="nr5g_disable_mode",2',
+		'nr5g: quectel sa = disable NSA (2)');
+	// an MBIM RM502Q: no manufacturer yet, only the firmware string
+	eq(atcmd.nr5g_dialect({ firmware: 'RM502QAEAAR13A04M4G' }), 'quectel', 'nr5g: a Quectel known by its firmware string');
+	// the command is documented for the RG50xQ/RM5xxQ only: another Quectel
+	// would get a persistent write on a bare ERROR
+	eq(atcmd.nr5g_mode_commands({ manufacturer: 'Quectel', model: 'RG650E-EU' }, { nr5g_mode: 'sa' }), [],
+		'nr5g: a Quectel outside the documented families gets nothing sent');
+	eq(atcmd.nr5g_dialect({ manufacturer: 'Foxconn', model: 'T77W968' }), null,
+		'nr5g: another Foxconn module is not taken for a T99W175');
+
+	eq(atcmd.nr5g_mode_commands(q, {}), [], 'nr5g: unset leaves the modem alone');
+	eq(atcmd.nr5g_mode_commands({ manufacturer: 'Fibocom', model: 'FM350-GL' }, { nr5g_mode: 'sa' }), [],
+		'nr5g: a modem of neither dialect gets nothing sent');
+	eq(atcmd.nr5g_mode_commands({}, { nr5g_mode: 'sa' }), [], 'nr5g: an unidentified modem is not guessed at');
+}
 eq(atcmd.cell_lock_commands({ lock_4g: 'garbage' }), [], 'lock: malformed ignored');
 eq(atcmd.cell_lock_commands({ lock_persist: true }), [], 'lock: persist alone is no-op');
 
@@ -424,6 +460,13 @@ let lk4n = atcmd.parse_qnwlock([ '+QNWLOCK: "common/4g",3,1725,59,75,59,6200,102
 eq([ lk4n.enabled, lk4n.values ], [ true, [ 1725, 59, 75, 59, 6200, 102 ] ],
 	'qnwlock: a cell list reads as locked, values are the pairs');
 eq(atcmd.parse_qnwlock([ 'OK' ]), null, 'qnwlock: no lock line -> null');
+// a locked 5G read has no enable field (RG502Q-EA, 2026-11-17): PCI first
+let lk5 = atcmd.parse_qnwlock([ '+QNWLOCK: "common/5g",100,636666,30,78' ]);
+eq([ lk5.enabled, lk5.values ], [ true, [ 100, 636666, 30, 78 ] ], 'qnwlock: locked 5G read keeps the PCI');
+lk5 = atcmd.parse_qnwlock([ '+QNWLOCK: "common/5g",0,636666,30,78' ]);
+eq([ lk5.enabled, lk5.values ], [ true, [ 0, 636666, 30, 78 ] ], 'qnwlock: PCI 0 is a lock, not "off"');
+lk5 = atcmd.parse_qnwlock([ '+QNWLOCK: "common/5g",1,100,636666,30,78' ]);
+eq([ lk5.enabled, lk5.values ], [ true, [ 100, 636666, 30, 78 ] ], 'qnwlock: the documented <enable> form');
 
 // --- AT+QENG servingcell parsing (LTE + NR5G-NSA) ----------------------------
 // real lines from an RG502Q on LTE B3 + NR5G-NSA n1
@@ -746,9 +789,36 @@ eq(cpol_torn[3].oper, 'A1 HR', 'cpol: ...intact');
 
 // --- temperature parsers (QModem-derived) ------------------------------------
 
-// Quectel AT+QTEMP: sensor-name digits skipped, first in-range value wins
+// Quectel AT+QTEMP: sensor-name digits skipped, out-of-range ignored
 eq(atcmd.parse_qtemp([ '+QTEMP: "cpu0-0-usr","35"', '+QTEMP: "pa1","120"' ]), 35, 'qtemp: quoted sensor,val');
 eq(atcmd.parse_qtemp([ '+QTEMP: 42' ]), 42, 'qtemp: bare value');
+// unnamed three-value form (EG06/BG96, HW-read 2026-11-18): the first (PMIC)
+eq(atcmd.parse_qtemp([ '+QTEMP: 27,25,26', 'OK' ]), 27, 'qtemp: unnamed list -> first value');
+// RG500Q-EA (ddimension/wwand#93): the first line is the PA, which lags; the
+// hottest SoC sensor is the reading
+let qtemp_rg500q = [
+	'+QTEMP:"qfe_wtr_pa0","35"', '+QTEMP:"qfe_wtr_pa1","0"', '+QTEMP:"qfe_wtr_pa2","0"',
+	'+QTEMP:"qfe_wtr_pa3","0"', '+QTEMP:"aoss0-usr","44"', '+QTEMP:"mdm-q6-usr","44"',
+	'+QTEMP:"ipa-usr","45"', '+QTEMP:"cpu0-a7-usr","44"', '+QTEMP:"mdm-5g-usr","45"',
+	'+QTEMP:"mdm-vpe-usr","44"', '+QTEMP:"mdm-core-usr","45"', '+QTEMP:"xo-therm-usr","43"',
+	'+QTEMP:"sdx-case-therm-usr","42"', '+QTEMP:"ambient-therm-usr","43"', 'OK' ];
+eq(atcmd.parse_qtemp(qtemp_rg500q), 45, 'qtemp: RG500Q -> hottest SoC sensor, not the PA');
+// ...a PA hotter than the SoC still does not win
+eq(atcmd.parse_qtemp([ '+QTEMP:"qfe_wtr_pa0","60"', '+QTEMP:"mdm-core-usr","40"' ]), 40, 'qtemp: an RF sensor never beats a SoC one');
+// RG650E (HW-read on .245, 2026-11-18): sdr0 first, mmw0 a -273 sentinel
+let qtemp_rg650e = [
+	'+QTEMP: "sdr0","26"', '+QTEMP: "mmw0","-273"', '+QTEMP: "aoss-0","31"',
+	'+QTEMP: "cpuss-0","32"', '+QTEMP: "ethphy-0","33"', '+QTEMP: "mdmss-0","32"',
+	'+QTEMP: "sys-therm-1","29"', 'OK' ];
+eq(atcmd.parse_qtemp(qtemp_rg650e), 33, 'qtemp: RG650E -> not sdr0, -273 ignored');
+// only RF sensors read: report one rather than nothing
+eq(atcmd.parse_qtemp([ '+QTEMP:"qfe_wtr_pa0","35"', '+QTEMP:"mdm-core-usr","0"' ]), 35, 'qtemp: RF only -> the RF reading');
+// a digit in the name is not the value
+eq(atcmd.parse_qtemp([ '+QTEMP:"sensor-55","30"' ]), 30, 'qtemp: value from the second field, not the name');
+// a named sentinel next to an unnamed answer does not hide the answer
+eq(atcmd.parse_qtemp([ '+QTEMP: 27,25,26', '+QTEMP: "mmw0","-273"' ]), 27, 'qtemp: mixed, named sentinel -> the unnamed value');
+// the late EG18 line (urc_common feeds it alone)
+eq(atcmd.parse_qtemp([ '+QTEMP: "xo_therm_buf","32"' ]), 32, 'qtemp: single named line');
 eq(atcmd.parse_qtemp([ '+QTEMP: "modem-ambient","5"' ]), null, 'qtemp: below floor -> null');
 eq(atcmd.parse_qtemp([ 'OK' ]), null, 'qtemp: no line -> null');
 // THE DIE TEMPERATURE IS THE SECOND FIELD, and these two captures are the same
@@ -890,8 +960,31 @@ eq(atcmd.find_tty(ncm_tty_fx, 'usb0', null), '/dev/ttyUSB2', 'find: netdev-ancho
 eq(atcmd.find_tty(quectel_fx(), '/dev/cdc-wdm0', '/dev/ttyACM7'), '/dev/ttyACM7', 'find: override wins');
 
 // board quirk wins over lookup
-let bfx = quectel_fx({ files: { '/tmp/sysinfo/board_name': "zyxel,nr7101\n" } });
+const BOARD_TTY2 = { '/sys/class/tty/ttyUSB2': [ '/sys/class/tty/ttyUSB2' ] };
+let bfx = quectel_fx({ files: { '/tmp/sysinfo/board_name': "zyxel,nr7101\n" }, globs: BOARD_TTY2 });
 eq(atcmd.find_tty(bfx, '/dev/cdc-wdm0', null), '/dev/ttyUSB2', 'find: board quirk');
+
+// ...but only while the board's port exists. A Zyxel LTE3301-M209 refitted with
+// a Huawei ME906s in its MBIM configuration has ONE tty, ttyUSB0 on interface 2,
+// and it answers AT (HW-observed 2026-11-18); the board's ttyUSB2 is absent, and
+// holding to it left the session without an AT port.
+const HBASE = '/sys/class/usbmisc/cdc-wdm0/device/..';
+let me906s_fx = fakefx.create({
+	files: {
+		'/tmp/sysinfo/board_name': "zyxel,lte3301-m209\n",
+		[sprintf('%s/idVendor', HBASE)]: "12d1\n",
+		[sprintf('%s/idProduct', HBASE)]: "15c1\n",
+		[sprintf('%s/1-1:3.2/bInterfaceNumber', HBASE)]: "02\n",
+	},
+	globs: {
+		[sprintf('%s/*/tty*', HBASE)]: [ sprintf('%s/1-1:3.2/ttyUSB0', HBASE) ],
+		'/sys/class/tty/ttyUSB2': [],
+	},
+});
+eq(atcmd.find_tty(me906s_fx, '/dev/cdc-wdm0', null), '/dev/ttyUSB0',
+	'find: an absent board port falls through to discovery');
+eq(atcmd.find_tty(me906s_fx, '/dev/cdc-wdm0', null, null, [ '/dev/ttyUSB2' ]), '/dev/ttyUSB0',
+	'find: ...also on the retry after the board port failed to open');
 
 // unknown usb id: heuristic fallback, first sorted tty
 let ufx = quectel_fx({ files: { [sprintf('%s/idVendor', BASE)]: "dead\n" } });
@@ -957,7 +1050,7 @@ eq(atcmd.find_tty(ec200a_fx, 'usb0', '/dev/ttyUSB0', null, [ '/dev/ttyUSB0' ]), 
 	'skip: a mute explicit override is reported, not worked around');
 
 // same for a board quirk
-let bskip = quectel_fx({ files: { '/tmp/sysinfo/board_name': "zyxel,nr7101\n" } });
+let bskip = quectel_fx({ files: { '/tmp/sysinfo/board_name': "zyxel,nr7101\n" }, globs: BOARD_TTY2 });
 eq(atcmd.find_tty(bskip, '/dev/cdc-wdm0', null, null, [ '/dev/ttyUSB2' ]), null,
 	'skip: a mute board-quirk port is not swapped for a guess');
 
@@ -985,6 +1078,29 @@ let ec200a_known = fakefx.create({
 
 eq(atcmd.find_tty(ec200a_known, 'usb0', null), '/dev/ttyUSB2',
 	'EC200A: the port table takes it straight to if4, no probing');
+
+// ZTE MF286D (19d2:1485): if2 opens and stays mute, if3 answers, if4 is the
+// secondary port. Without the entry the first-tty guess lands on the mute if2.
+// Interface -> tty map as reported in ddimension/wwand#85 (AT on ttyUSB1).
+let mf286d = fakefx.create({
+	files: {
+		[sprintf('%s/idVendor', BASE)]: "19d2\n",
+		[sprintf('%s/idProduct', BASE)]: "1485\n",
+		[sprintf('%s/1-1:1.2/bInterfaceNumber', BASE)]: "02\n",
+		[sprintf('%s/1-1:1.3/bInterfaceNumber', BASE)]: "03\n",
+		[sprintf('%s/1-1:1.4/bInterfaceNumber', BASE)]: "04\n",
+	},
+	globs: {
+		[sprintf('%s/*/tty*', BASE)]: [
+			sprintf('%s/1-1:1.2/ttyUSB0', BASE),
+			sprintf('%s/1-1:1.3/ttyUSB1', BASE),
+			sprintf('%s/1-1:1.4/ttyUSB2', BASE),
+		],
+	},
+});
+let mf286d_ch = atcmd.find_at_channels(mf286d, '/dev/cdc-wdm0', null);
+eq(mf286d_ch.primary, '/dev/ttyUSB1', 'MF286D: the port table takes it straight to if3');
+eq(mf286d_ch.telemetry, '/dev/ttyUSB2', 'MF286D: if4 is the secondary AT port');
 
 // local override for devices missing in the generated table (RG650E)
 let rg650 = quectel_fx({ files: { [sprintf('%s/idProduct', BASE)]: "0122\n" } });
@@ -1120,6 +1236,49 @@ eq(urcs3, [ '+CTZV: +32,0', '+CGEV: ME PDN ACT 1' ],
 	'engine: URCs inside a command window reach on_urc');
 eq(got3?.lines, [], 'engine: ... and stay OUT of the response lines');
 
+// THE PDU URCS ARE TWO LINES (27.005 3.4.1): `+CBM: <len>` / `+CMT: ,<len>`
+// and then the PDU. Inside a command the PDU line was taken for the answer;
+// idle it was dropped as no URC. Both go out as one `header\npdu` — and only a
+// hex line of the announced length is that PDU: a command's own answer can be
+// hex as well.
+{
+	let u = [], r = null;
+	let t = fake_transport();
+	let e = atcmd.create(t, { log: silent, on_urc: (l) => push(u, l) });
+	let cbm = '';
+	let tpdu = '';
+
+	for (let i = 0; i < 88; i++) cbm += 'AB';
+	for (let i = 0; i < 24; i++) tpdu += '11';
+
+	e.send('AT+CSQ', (err, res) => r = res);
+	t.reply('\r\n+CBM: 88\r\n' + cbm + '\r\n+CSQ: 20,99\r\nOK\r\n');
+	eq(u, [ '+CBM: 88\n' + cbm ], 'engine: +CBM and its PDU inside a command, as one URC');
+	eq(r?.lines, [ '+CSQ: 20,99' ], 'engine: ...and the PDU is not the answer');
+
+	t.reply('\r\n+CMT: "",24\r\n00' + tpdu + '\r\n');
+	eq(u[1], '+CMT: "",24\n00' + tpdu, 'engine: +CMT and its PDU (SMSC not counted) while idle');
+
+	t.reply('\r\n+CMT: "Doe, John",24\r\n00' + tpdu + '\r\n');
+	eq(u[2], '+CMT: "Doe, John",24\n00' + tpdu, 'engine: an alias with a comma');
+	splice(u, 2, 1);
+
+	t.reply('\r\n+CBM: 88\r\n+CEREG: 1\r\n');
+	eq([ u[2], u[3] ], [ '+CBM: 88', '+CEREG: 1' ], 'engine: a header without its PDU goes out alone');
+
+	t.reply('\r\n+CMTI: "SM",3\r\n');
+	eq(u[4], '+CMTI: "SM",3', 'engine: +CMTI is one line as before');
+
+	// a command's hex answer right behind a held header stays the answer
+	let r2 = null;
+
+	t.reply('\r\n+CBM: 88\r\n');
+	e.send('AT+CCID', (err, res) => r2 = res);
+	t.reply('\r\n89490200001844967110\r\nOK\r\n');
+	eq(r2?.lines, [ '89490200001844967110' ], 'engine: a hex answer of another length is not the PDU');
+	eq(u[5], '+CBM: 88', 'engine: ...and the header went out alone');
+}
+
 // the running command's OWN prefix is its answer, never a URC — AT+CEREG?
 // legitimately replies "+CEREG:", and a +CEREG URC may ride along with it
 let urcs4 = [], got4 = null;
@@ -1156,6 +1315,44 @@ tr8.reply('\r\nRING\r\nFibocom\r\nOK\r\n');
 
 eq(got6?.lines, [ 'Fibocom' ], 'engine: a bare RING never becomes the manufacturer');
 eq(urcs6, [ 'RING' ], 'engine: prefix-less URC dispatched');
+
+// ... but to a dial a call-progress code IS the final result (V.250 6.3.1):
+// the dial ends with it at once instead of waiting for an OK that never comes
+let urcs6d = [], got6d = null, err6d = null;
+let tr8d = fake_transport();
+let at8d = atcmd.create(tr8d, { log: silent, on_urc: (l) => push(urcs6d, l) });
+
+at8d.send('ATD+491701234567;', (e, r) => { err6d = e; got6d = r; });
+tr8d.reply('\r\nNO CARRIER\r\n');
+
+eq(err6d, { error: 'no carrier' }, 'engine: NO CARRIER ends a dial as its result');
+eq(urcs6d, [], 'engine: ... and is not dispatched as a URC');
+
+let err6b = null;
+let tr8b = fake_transport();
+let at8b = atcmd.create(tr8b, { log: silent });
+
+at8b.send('ATA', (e) => err6b = e);
+tr8b.reply('\r\nBUSY\r\n');
+eq(err6b, { error: 'busy' }, 'engine: BUSY ends an ATA');
+
+// a RING inside a dial window still announces a call, it does not answer it
+let urcs6r = [], err6r = 'unset';
+let tr8r = fake_transport();
+let at8r = atcmd.create(tr8r, { log: silent, on_urc: (l) => push(urcs6r, l) });
+
+at8r.send('ATD+491701234567;', (e) => err6r = e);
+tr8r.reply('\r\nRING\r\nOK\r\n');
+eq(err6r, null, 'engine: a dial still ends on OK');
+eq(urcs6r, [ 'RING' ], 'engine: RING during a dial stays a URC');
+
+let urcs6s = [], err6s = 'unset';
+let tr8s = fake_transport();
+let at8s = atcmd.create(tr8s, { log: silent, on_urc: (l) => push(urcs6s, l) });
+
+at8s.send('ATD+491701234567;', (e) => err6s = e);
+tr8s.reply('\r\nRING 1\r\nOK\r\n');
+eq([ err6s, urcs6s ], [ null, [ 'RING 1' ] ], 'engine: ...and so does the numbered form (RING 1)');
 
 // one buffer for the whole stream: a line split across a command boundary used
 // to be torn in half — its head dropped and its tail pushed into the NEXT

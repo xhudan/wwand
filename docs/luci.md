@@ -25,8 +25,9 @@ connections** per modem, plus the per-ICCID SIM override table. Each row has
 **Edit** (the modem), **Status**, **Delete** and an **Actions** menu: **Tools**,
 **Reboot** — which resets just that modem (GPIO reset if the board exposes one,
 otherwise a backend soft reset; its connections drop briefly and recover on
-their own) — **Repower**, **Reattach** and, where they apply, **Unlock SIM**
-and **Save SIM** (a per-ICCID entry for the inserted card).
+their own) — **Repower**, **Reattach**, **Reinit SIM**, **Detach** / **Attach**
+and, where they apply, **Unlock SIM** and **Save SIM** (a per-ICCID entry for the
+inserted card).
 
 ![Modems overview](images/luci-modems-list.png)
 
@@ -44,7 +45,8 @@ an unattended one-shot conversion there is an example uci-defaults script in
 The per-modem dialog (Edit button). Hardware binding by **device path**
 (a dropdown of detected modems + free text), USB serial or IMEI; the **FCC
 unlock** method for laptop-SKU modems; the generic **Reset modem** button;
-SIM slot, PIN, radio and resilience tabs.
+SIM slot, PIN, radio and resilience tabs. *Radio & Cell* also switches
+**Cell Broadcast** (leave / on / off) and lists its channels.
 
 ![Modem config](images/luci-modem-config.png)
 
@@ -103,13 +105,17 @@ as `?sim=<ICCID>`.
 
 ![SIM cards](images/luci-sim-cards.png)
 
-## Modem Tools — bands, operator, cell lock, SIM, eSIM, SMS
+## Modem Tools — bands, operator, cell lock, SIM, eSIM, SMS, USSD, Cell Broadcast
 
 Radio-technology and per-band selection, manual/automatic **network
-selection** with an operator scan, **cell lock**, SIM slot & PIN control, full
+selection** with an operator scan, **cell lock**, SIM slot and **SIM PIN**
+(turn the PIN query on or off, **change the PIN**; the configured PIN follows,
+and with fewer than two attempts left the page asks before it tries), full
 **eSIM profile management** (download via activation code through lpac,
-enable/disable/delete, provider confirmations), SIM PLMN preference lists and
-SMS.
+enable/disable/delete, provider confirmations), SIM PLMN preference lists,
+SMS (list, delete the ticked ones, **send** — a long text in several parts),
+**USSD** (send a code, answer the network's question, end the session)
+and the last **Cell Broadcast** messages.
 
 ![Modem Tools](images/luci-modem-tools.png)
 

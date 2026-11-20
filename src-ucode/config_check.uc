@@ -13,9 +13,114 @@
 
 import * as qmi_backend from 'wwand.qmi_backend';
 import * as modem_quirks from 'wwand.modem_quirks';
-import * as atcmd from 'wwand.atcmd';
+import * as cell_lock from 'wwand.cell_lock';
 import * as nasmod from 'wwand.codec.schema.nas';
 import * as modem_common from 'wwand.modem_common';
+
+// The acquisition-order checks over one GET_SYSTEM_SELECTION_PREFERENCE reply
+// `d`, as config_warnings entries: a configured `rat_order` the modem does not
+// hold, and a RAT the mode mask allows that the order leaves out — that one
+// may never be searched for: a T99W175 with NR5G enabled and an order of
+// lte,umts never tried SA (ddimension/wwand#75). Shared by the QMI validate
+// pass below and the MBIM init (sync_rat_order). `rats` = the RAT slugs the
+// modem supports (modem_common.mode_rats), or null when unknown: a mode mask
+// often has every bit set, and an RG650E "allowing" GSM it has no radio for
+// is not a gap (HW-seen on the Chateau, 2026-10-30). [] when the modem
+// reports no order.
+export function rat_order_warnings(config, d, rats)
+{
+	let out = [];
+	let ao = d?.acquisition_order;
+
+	if (type(ao) != 'array' || !length(ao))
+		return out;
+
+	let have = join(',', nasmod.rat_order_names(ao));
+	let order = nasmod.rat_order_ids(config?.rat_order);
+
+	if (order != null && sprintf('%J', ao) != sprintf('%J', order))
+		push(out, { check: 'rat_order', severity: 'warn',
+			message: nasmod.rat_order_writable(ao)
+				? sprintf('modem RAT order %s does not match configured rat_order "%s"',
+					have, config.rat_order)
+				: sprintf('configured rat_order "%s" is not applied: the modem\'s order %s has slots QMI cannot name (IoT technologies) — set it with the vendor command',
+					config.rat_order, have),
+			expected: config.rat_order, actual: have });
+
+	// the mode bits that map to one radio interface; CDMA's bit pair is left
+	// out, the order lists 1x and EVDO apart
+	let live = d.mode_preference;
+	let left_out = [];
+
+	if (live != null)
+		for (let name in [ 'gsm', 'umts', 'lte', 'td-scdma', 'nr5g' ])
+			if ((live & nasmod.MODE_BITS[name]) && index(ao, nasmod.RAT_ORDER_IDS[name]) < 0 &&
+			    (type(rats) != 'array' || index(rats, name) >= 0))
+				push(left_out, name);
+
+	if (length(left_out)) {
+		let pron = (length(left_out) == 1) ? 'it' : 'them';
+
+		push(out, { check: 'rat_order', severity: 'warn',
+			message: sprintf('modem allows %s, but its RAT acquisition order (%s) leaves %s out, so the modem may never search for %s — set option rat_order',
+				join(',', left_out), have, pron, pron),
+			expected: join(',', left_out), actual: have });
+	}
+
+	return out;
+};
+
+// MBIM's half of `option rat_order`: the QMI init writes it beside the mode
+// mask (modem_init_qmi step_confnet_apply) and validate() below checks it; an
+// MBIM modem has neither pass, and the order is QMI-only state, so it goes
+// through the QMI-over-MBIM passthrough NAS here — written when configured
+// and different, then checked the same way. A modem without a passthrough
+// keeps its own order; a configured one is then reported, not dropped
+// silently. Replaces this function's earlier entries, so a re-init does not
+// stack them. cb() always.
+export function sync_rat_order(self, log, cb)
+{
+	let warn = (list) => {
+		self.config_warnings = filter(self.config_warnings ?? [], (w) => w.check != 'rat_order');
+
+		for (let w in list)
+			push(self.config_warnings, w);
+
+		cb();
+	};
+
+	let order = nasmod.rat_order_ids(self.config?.rat_order);
+
+	self.with_nas((nas) => {
+		if (!nas)
+			return warn(order ? [ { check: 'rat_order', severity: 'warn',
+				message: sprintf('rat_order "%s" is not applied: it needs QMI NAS, and this modem offers no QMI passthrough',
+					self.config.rat_order),
+				expected: self.config.rat_order, actual: null } ] : []);
+
+		nas.request('GET_SYSTEM_SELECTION_PREFERENCE', {}, (err, d) => {
+			if (err || !d)
+				return warn([]);   // unreadable -> nothing to say
+
+			if (order == null || sprintf('%J', d.acquisition_order) == sprintf('%J', order) ||
+			    (type(d.acquisition_order) == 'array' && !nasmod.rat_order_writable(d.acquisition_order)))
+				return warn(rat_order_warnings(self.config, d, modem_common.mode_rats(self)));
+
+			log('notice', sprintf('setting RAT order "%s" (modem had %s)', self.config.rat_order,
+				join(',', nasmod.rat_order_names(d.acquisition_order)) || '?'));
+
+			// permanent, like the QMI init write (modem_init_qmi step_confnet_apply)
+			nas.request('SET_SYSTEM_SELECTION_PREFERENCE', { acquisition_order: order, change_duration: 1 }, (serr) => {
+				if (serr) {
+					log('warn', sprintf('setting the RAT order failed: %J', serr));
+					return warn(rat_order_warnings(self.config, d, modem_common.mode_rats(self)));
+				}
+
+				warn(rat_order_warnings(self.config, { ...d, acquisition_order: order }, modem_common.mode_rats(self)));
+			}, { no_recovery: true });
+		}, { no_recovery: true });
+	});
+};
 
 // compare the live modem against self.config + modem_quirks and populate
 // self.config_warnings = [ { check, severity:'warn'|'info', message, expected,
@@ -25,7 +130,10 @@ import * as modem_common from 'wwand.modem_common';
 export function validate(self, log, cb)
 {
 	cb = cb ?? (() => null);
-	self.config_warnings = [];   // refreshed on every init
+	// refreshed on every init — except what the AT init owns (the 5G NR mode,
+	// modem_common.init_commands), which may have run first and does not run
+	// again before the next AT open
+	self.config_warnings = filter(self.config_warnings ?? [], (w) => w.check == 'nr5g_mode');
 
 	let quirks = modem_quirks.for_model(self.info?.model);
 
@@ -100,6 +208,8 @@ export function validate(self, log, cb)
 		if (mask == null && args.network_selection == null)
 			return done();
 
+		args.change_duration = 1;   // permanent, like the init write (modem_init_qmi)
+
 		log('notice', 'auto_correct_config: re-applying NAS system selection preference');
 		self.nas.request('SET_SYSTEM_SELECTION_PREFERENCE', args, (err) => {
 			if (err)
@@ -147,108 +257,24 @@ export function validate(self, log, cb)
 		}, { probe: true });   // not every Quectel has the setting (RG50xQ)
 	};
 
-	// A LOCK THE CONFIG NO LONGER ASKS FOR IS RELEASED.
-	//
-	// cell_lock_commands() only ever emits a lock when one is CONFIGURED, so
-	// deleting `lock_4g` used to leave the modem locked forever: nothing was
-	// sent, and the modem kept searching for a cell that may not exist. With
-	// `lock_persist` the lock is in modem NV, so it survived reboots and
-	// AT+CFUN resets too — a box that could not be recovered by editing the
-	// config at all. Found on an NR7101 locked to EARFCN 1300 / PCI 246, a cell
-	// not receivable there: permanent "servingcell","SEARCH", never attached
-	// (2026-09-11). Releasing it brought the modem up on EARFCN 6300 within
-	// seconds.
-	//
-	// Read-before-write, like every other setting in this tree: the release is
-	// sent only when the modem actually reports a lock, so a box that never had
-	// one costs one read. `save_ctrl` follows a release because the lock being
-	// cleared may have been persisted by an EARLIER config — without it a power
-	// cycle would restore it (HW-verified on the NR7101).
-	let release_lock = (which, cb) => {
-		if (!self.at)
-			return cb();
-
-		// a probe: a modem without that RAT has no such lock to read
-		self.at.send(sprintf('AT+QNWLOCK="common/%s"', which), (e, r) => {
-			let lk = e ? null : atcmd.parse_qnwlock(r?.lines);
-
-			if (!lk || !lk.enabled)
-				return cb();
-
-			log('notice', sprintf('modem reports a %s cell lock the config does not ask for — releasing it (a lock nothing configured keeps the modem searching for a cell that may not be there)',
-				uc(which)));
-
-			self.at.send(sprintf('AT+QNWLOCK="common/%s",0', which), (e2) => {
-				if (e2) {
-					add(sprintf('lock_%s', which), 'warn',
-						sprintf('a %s cell lock is set on the modem and could not be released: %J',
-							uc(which), e2), 'released', 'still set');
-					return cb();
-				}
-
-				// persist the RELEASE, in case the lock was saved to NV
-				self.at.send('AT+QNWLOCK="save_ctrl",1,1', () => cb());
-			});
-		}, { probe: true });
-	};
-
-	// cell locks: if config sets lock_4g/lock_5g, read them back (best-effort
-	// AT+QNWLOCK) and warn if the modem reports them off / unreadable. When it
-	// sets NEITHER, make sure the modem is not carrying one from an older
-	// config — see release_lock above.
-	check_locks = () => {
-		let l4 = self.config.lock_4g ?? [];
-
-		if (type(l4) == 'string')
-			l4 = [ l4 ];
-
-		let l5 = self.config.lock_5g;
-
-		if (!self.at)
-			return check_autoconnect();
-
-		if (!length(l4) && !l5)
-			return release_lock('4g', () => release_lock('5g', check_autoconnect));
-
-		let check5 = () => {
-			if (!l5)
-				return check_autoconnect();
-
-			self.at.send('AT+QNWLOCK="common/5g"', (e, r) => {
-				let lk = atcmd.parse_qnwlock(r?.lines);
-
-				if (e || !lk || !lk.enabled)
-					add('lock_5g', 'warn',
-						sprintf('configured 5G cell lock %s is not applied on the modem', l5),
-						l5, (lk && lk.enabled) ? 'set' : 'off');
-
-				check_autoconnect();
-			});
-		};
-
-		if (!length(l4))
-			return check5();
-
-		self.at.send('AT+QNWLOCK="common/4g"', (e, r) => {
-			let lk = atcmd.parse_qnwlock(r?.lines);
-
-			if (e || !lk || !lk.enabled)
-				add('lock_4g', 'warn',
-					sprintf('configured 4G cell lock [%s] is not applied on the modem', join(',', l4)),
-					l4, (lk && lk.enabled) ? 'set' : 'off');
-
-			check5();
-		});
-	};
+	// cell locks: brought to what the config asks for — set when configured,
+	// RELEASED when not (a stale lock keeps a modem searching for a cell that
+	// may not be there), in whichever dialect the modem answers
+	// (cell_lock.uc). The QMI modem syncs here and not after its AT init
+	// (modem_common.run_at_init): this is where config_warnings are rebuilt,
+	// and a modem without an AT port still has its NAS client.
+	check_locks = () => cell_lock.sync(self, log, add, check_autoconnect);
 
 	let want = qmi_backend.parse_modes(self.config.modes);
 	let pinned = self.config.mcc && self.config.mnc;
 
-	// NAS system-selection prefs: RAT mode mask + auto/manual network
-	// selection. Only read when config actually constrains one of them —
-	// nothing to validate otherwise, and it avoids a needless GET.
+	// NAS system-selection prefs: RAT mode mask, acquisition order and
+	// auto/manual network selection. Read even when config constrains none
+	// of them: a RAT the mode mask allows and the acquisition order leaves
+	// out may never be searched for — a T99W175 with NR5G enabled and an
+	// order of lte,umts never tried SA (ddimension/wwand#75).
 	self.with_nas((nas) => {
-		if (!nas || (want == null && !pinned))
+		if (!nas)
 			return check_locks();
 
 		nas.request('GET_SYSTEM_SELECTION_PREFERENCE', {}, (err, d) => {
@@ -269,6 +295,9 @@ export function validate(self, log, cb)
 						missing ? sprintf('; config also wants 0x%02x', missing) : ''),
 					want & nasmod.MODE_ALL, live);
 			}
+
+			for (let w in rat_order_warnings(self.config, d, modem_common.mode_rats(self)))
+				push(self.config_warnings, w);
 
 			// network selection: config pins a PLMN -> expect manual; the GET
 			// reply carries only the mode (u8), so a wrong manual PLMN is caught

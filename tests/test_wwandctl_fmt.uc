@@ -430,7 +430,7 @@ eq(fmt.reg_text({ state: 'READY', rat: 'LTE',
 
 // --- euicc_text: what the card's ISD-R says ----------------------------------
 eq(fmt.euicc_text({ sgp32: true, ipae_supported: true, svn: '2.5.0', ipa: 'ipae' }),
-   'SGP.32 IoT (on SGP.22 2.5.0) · IPA in the card (IPAe) — no ES10 from the router',
+   'SGP.32 IoT (on SGP.22 2.5.0) · IPA in the card (IPAe) — no ES10 from the router (option ipa_mode \'ipad\')',
    'euicc: an IPAe card says why ES10 fails');
 eq(fmt.euicc_text({ sgp32: false, svn: '2.2.2' }), 'SGP.22 2.2.2', 'euicc: an SGP.22 card');
 eq(fmt.euicc_text(null), null, 'euicc: nothing read');
@@ -506,5 +506,51 @@ eq(fmt.select_args('m0', '262', '01')?.mnc_digits, 2, 'select: a two-digit MNC s
 eq(type(fmt.select_args('m0', '262', '01')?.mcc), 'int', 'select: not the argv string');
 eq(fmt.select_args('m0', '26x', '01'), null, 'select: a non-number is refused, not sent');
 eq(fmt.select_args('m0', '262', '1'), null, 'select: a one-digit MNC is no MNC');
+
+// --- raw QMI / MBIM command lines ------------------------------------------
+eq([ fmt.raw_num('0x24'), fmt.raw_num('36'), fmt.raw_num('0X1a'), fmt.raw_num('x'), fmt.raw_num('1e3'), fmt.raw_num(null) ],
+	[ 36, 36, 26, null, null, null ], 'raw_num: hex and decimal, nothing else');
+eq([ fmt.qmi_service_id('nas'), fmt.qmi_service_id('UIM'), fmt.qmi_service_id('0x2a'), fmt.qmi_service_id('nope') ],
+	[ 3, 11, 42, null ], 'qmi_service_id: libqmi names or numbers');
+
+// the length is little endian: 0x0102 bytes is "0201", not "0102"
+eq(fmt.qmi_raw_payload([ '0x01=00', '16=aa:bb cc' ]).payload, '01010000' + '100300aabbcc',
+	'qmi_raw_payload: type, u16 LE length, value; separators between bytes allowed');
+let big = '';
+for (let i = 0; i < 0x102; i++)
+	big += 'ab';
+eq(substr(fmt.qmi_raw_payload([ '1=' + big ]).payload, 0, 6), '010201',
+	'qmi_raw_payload: the length is little endian');
+eq(fmt.qmi_raw_payload([]).payload, '', 'qmi_raw_payload: no TLVs is an empty request');
+ok(fmt.qmi_raw_payload([ '1=abc' ]).error, 'qmi_raw_payload: half a byte is refused');
+ok(fmt.qmi_raw_payload([ '256=00' ]).error, 'qmi_raw_payload: a type past one byte is refused');
+ok(fmt.qmi_raw_payload([ 'abcd' ]).error, 'qmi_raw_payload: an argument that is no TYPE=HEX is refused');
+
+eq(fmt.qmi_raw_text({ result: 1, error_code: 26, tlvs: [ { type: 2, value: '01001a00' } ] }),
+	'result   failure, error 26 (0x001a) NoEffect\ntlv 0x02     4  01 00 1a 00',
+	'qmi_raw_text: a refusal by its libqmi name, then the TLVs');
+let seq = '';
+for (let i = 0; i < 17; i++)
+	seq += sprintf('%02x', i);
+eq(fmt.qmi_raw_text({ result: 0, tlvs: [ { type: 0x10, value: seq } ] }),
+	'result   success\ntlv 0x10    17  00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n               10',
+	'qmi_raw_text: a long value wraps at 16 bytes, aligned');
+eq(fmt.mbim_raw_text({ status: 9, status_name: 'NoDeviceSupport', info: '' }),
+	'status   9 NoDeviceSupport\ninfo     0  (empty)', 'mbim_raw_text: status and an empty buffer');
+
+// --- SMS: the slots a listing shows are the ones sms-delete takes (wwand#94) --
+eq(fmt.sms_slots({ index: 0 }), '0', 'sms_slots: a single part, slot 0 is real');
+eq(fmt.sms_slots({ concat_ref: 12210, parts: 2, indexes: [ 4, 5 ] }), '4,5',
+	'sms_slots: a joined message lists its parts, not a null printed as 0');
+eq(fmt.sms_slots({}), '?', 'sms_slots: nothing known');
+
+eq(fmt.sms_delete_args('m0', [ 'ME', '4,5' ]), { modem: 'm0', storage: 'ME', indices: [ 4, 5 ] },
+	'sms_delete_args: storage and a part list');
+eq(fmt.sms_delete_args('m0', [ '3' ]), { modem: 'm0', storage: 'SM', indices: [ 3 ] },
+	'sms_delete_args: SM by default, like `sms`');
+eq(fmt.sms_delete_args('m0', [ 'SM', '0', '1,2' ])?.indices, [ 0, 1, 2 ],
+	'sms_delete_args: slot 0, several arguments');
+eq(fmt.sms_delete_args('m0', [ 'ME' ]), null, 'sms_delete_args: no index');
+eq(fmt.sms_delete_args('m0', [ '4,x' ]), null, 'sms_delete_args: junk refused, not partly deleted');
 
 done('test_wwandctl_fmt');

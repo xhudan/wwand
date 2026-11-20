@@ -28,6 +28,10 @@ import * as qmi_backend from 'wwand.qmi_backend';
 import * as mbim_backend from 'wwand.mbim_backend';
 import * as modem_common from 'wwand.modem_common';
 import * as atcmd from 'wwand.atcmd';
+// read_ca_at (vendor-aware AT carrier-aggregation read) + the Fibocom parsers
+// live beside the NCM telemetry; all three telemetry_*.uc ship in base wwand,
+// so this is not a cross-backend package dependency.
+import * as tel_vendor from 'wwand.telemetry_ncm';
 import * as bc from 'wwand.codec.mbim_schema.basic_connect';
 
 export function install(self, o)
@@ -68,7 +72,7 @@ export function install(self, o)
 					(e, d) => ok(!e && tlv.has_payload(d)), { no_recovery: true })
 				: ok(false)) },
 			{ name: 'mbim', probe: (ok) => self.mbim
-				? mbim_backend.get_signal(self.mbim, (s) => ok(s != null))
+				? mbim_backend.get_signal(self.mbim, (s) => ok(s != null), self.reg?.data_class)
 				: ok(false) },
 		], (be) => {
 			if (be == 'mbim')
@@ -93,7 +97,7 @@ export function install(self, o)
 					outcome('_sig_be', s != null);
 					if (s) self.signal = s;
 					cb();
-				});
+				}, self.reg?.data_class);
 
 			if (be == 'qmi')
 				return with_pt(() => { outcome('_sig_be', false); cb(); }, (pt) => pt.nas.request('GET_SIGNAL_INFO', {}, (e, d) => {
@@ -111,9 +115,38 @@ export function install(self, o)
 		}, { reprobe: true, log: log, what: 'signal' });
 	};
 
+	// The serving cell over AT, in the modem's own dialect: (err, serving) with
+	// serving in the parse_qeng_servingcell shape, or null when the answer named
+	// no cell (a Huawei on GSM answers ^MONSC with a GSM line). ASKING ONE
+	// VENDOR'S COMMAND OF ANOTHER IS A TRANSPORT FAILURE ON EVERY TICK: an
+	// ME906s answers AT+QENG with ERROR, the ladder demoted the AT rung, the
+	// port-only probe picked it again, and "re-probing the ladder" was logged
+	// every 2-3 s (2026-11-18). A blank manufacturer still gets QENG, as before;
+	// a named vendor with no known read gets 'unsupported' and no AT rung.
+	// The third argument is true when the answer says the modem is on another
+	// RAT — a ^MONSC GSM/WCDMA line — so the last LTE cell is no longer true;
+	// an empty or unparsable OK says nothing and keeps it.
+	let at_serving = (cb) => {
+		let mfr = lc(sprintf('%s', self.info?.manufacturer ?? ''));
+
+		if (match(mfr, /huawei/))
+			return modem_common.telemetry_at(self).send('AT^MONSC', (e, r) => {
+				let sc = e ? null : atcmd.parse_monsc(r?.lines);
+				let other = !e && !sc &&
+					length(filter(r?.lines ?? [], (l) => match(l, /^\^MONSC:\s*(GSM|WCDMA|UMTS|TD-SCDMA)\b/)));
+				cb(e, sc ? tel_vendor.sc_to_serving(sc) : null, !!other);
+			});
+
+		if (mfr == '' || modem_common.qeng_ok(self))
+			return modem_common.telemetry_at(self).send('AT+QENG="servingcell"', (e, r) =>
+				cb(e, e ? null : atcmd.parse_qeng_servingcell(r?.lines)));
+
+		cb({ error: 'unsupported', detail: 'no AT serving-cell read for this vendor' }, null);
+	};
+
 	// cells: passthrough NAS cell-location info (decoded + scrubbed exactly as the
 	// QMI backend — richest serving + neighbour detail), else native MBIM Base
-	// Stations Info, else a best-effort AT QENG serving cell. Stores self.cells,
+	// Stations Info, else a best-effort AT serving cell (at_serving). Stores self.cells,
 	// preserving any carrier-aggregation set.
 	self._refresh_cells = function(cb) {
 		cb = cb ?? (() => null);
@@ -124,8 +157,11 @@ export function install(self, o)
 		// the same for AT: an OK whose QENG body is empty or momentarily
 		// unparsable is an answer, and counting it as a transport failure would
 		// send the ladder back to probe the dead ones.
-		let store = (c, answered) => {
+		let store = (c, answered, gone) => {
 			outcome('_cells_be', answered ?? (c != null));
+
+			if (gone)
+				self.cells = null;
 
 			if (c) {
 				if (ca != null)
@@ -147,7 +183,11 @@ export function install(self, o)
 			{ name: 'mbim', probe: (ok) => self.mbim
 				? mbim_backend.get_cells(self.mbim, (c) => ok(c != null))
 				: ok(false) },
-			{ name: 'at', probe: (ok) => ok(!!self.at) },
+			// the probe is the read itself, as on the CA ladder below: a port
+			// that exists says nothing about whether this vendor's read works
+			{ name: 'at', probe: (ok) => self.at
+				? at_serving((e) => ok(!e))
+				: ok(false) },
 		], (be) => {
 			if (be == 'mbim')
 				return mbim_backend.get_cells(self.mbim, (c) => store(c));
@@ -158,17 +198,14 @@ export function install(self, o)
 					{ no_recovery: true }));
 
 			if (be == 'at')
-				return modem_common.telemetry_at(self).send('AT+QENG="servingcell"', (e, r) => {
-					let serving = e ? null : atcmd.parse_qeng_servingcell(r?.lines);
-					store(serving ? { serving: serving } : null, !e);
-				});
+				return at_serving((e, serving, gone) => store(serving ? { serving: serving } : null, !e, gone));
 
 			cb();
 		}, { reprobe: true, log: log, what: 'cells' });
 	};
 
-	// carrier aggregation: passthrough NAS GET_LTE_CPHY_CA_INFO, else AT+QCAINFO
-	// (no native MBIM CA CID). Stores self.cells.ca. Mirrors the CA fetch in
+	// carrier aggregation: passthrough NAS GET_LTE_CPHY_CA_INFO, else the vendor
+	// AT read (no native MBIM CA CID), then RF band info for the NR leg. Stores self.cells.ca. Mirrors the CA fetch in
 	// telemetry_qmi.uc.
 	self._refresh_ca = function(cb) {
 		cb = cb ?? (() => null);
@@ -176,13 +213,34 @@ export function install(self, o)
 		if (!self.cells)   // nowhere to hang CA yet
 			return cb();
 
-		let store = (ca) => { if (self.cells) self.cells.ca = ca ?? []; cb(); };
+		// then RF band info over the passthrough adds the primary carrier of a
+		// leg the list lacks — a step after the choice, not a rung of it (see
+		// telemetry_qmi.uc _fetch_ca_info for why)
+		let store = (ca) => with_pt(() => {
+			if (self.cells) self.cells.ca = ca ?? [];
+			cb();
+		}, (pt) => qmi_backend.get_rf_bands(pt.nas, (rf) => {
+			if (self.cells) self.cells.ca = qmi_backend.ca_with_rf(ca, rf);
+			cb();
+		}));
 
 		backend.choose(self, '_ca_be', [
 			{ name: 'qmi', probe: (ok) => self._ensure_pt((up) => up
 				? qmi_backend.get_ca(self.pt.nas, (ca) => ok(ca != null))
 				: ok(false)) },
-			{ name: 'at', probe: (ok) => ok(!!self.at) },
+			// Probe the actual CA read, not just the port's existence: there is
+			// no native MBIM CA CID, so the AT command IS the backend — and it
+			// is vendor-specific (QCAINFO is Quectel; a Fibocom FM350 answers
+			// that with a bare ERROR, QCAINFO's modem-level "unsupported"). A
+			// port-only probe (`!!self.at`) would pick 'at', the dispatch would
+			// ERROR, outcome() would read that as a transport stall, and the
+			// ladder would demote and re-pick 'at' every tick — endless CA log
+			// spam on the FM350 (2026-10-30). read_ca_at asks the Fibocom way
+			// (AT+GTCAINFO?), so the probe succeeds and the dispatch returns
+			// real aggregation rows — the same reader the NCM Fibocom path uses.
+			{ name: 'at', probe: (ok) => self.at
+				? tel_vendor.read_ca_at(self, (e) => ok(!e))
+				: ok(false) },
 		], (be) => {
 			// an EMPTY list is a real answer here (no aggregation right now);
 			// only a null/error says the transport did not answer at all.
@@ -193,9 +251,9 @@ export function install(self, o)
 				}));
 
 			if (be == 'at')
-				return modem_common.telemetry_at(self).send('AT+QCAINFO', (e, r) => {
+				return tel_vendor.read_ca_at(self, (e, ca) => {
 					outcome('_ca_be', !e);
-					store(e ? [] : atcmd.parse_qcainfo(r?.lines));
+					store(ca ?? []);
 				});
 
 			store([]);
@@ -385,7 +443,10 @@ export function install(self, o)
 					// QMI/NCM parity; status `rat`/`caps` stayed null on MBIM
 					// without this). Where AT is dead (EG06) both latch off
 					// after the first timeout, so no per-tick re-tries.
-					modem_common.collect_temperature(self, () =>
+					// why 5G is held off, over a passthrough that is already up
+					// (opening one only for this is not worth it)
+					modem_common.collect_nr5g(self, self.pt?.nas, log, () =>
+					  modem_common.collect_temperature(self, () =>
 					    modem_common.probe_iot_rat(self, () => {
 						if (!self.mbim)
 							return;
@@ -393,7 +454,7 @@ export function install(self, o)
 						log_telemetry();
 						emit_telemetry();
 						telemetry_timer = uloop.timer(interval, tick);
-					})))))));
+					}))))))));
 			});
 		};
 

@@ -144,15 +144,22 @@ export function publish(conn, daemon, log)
 		// manual PIN release: enter the PIN once past the low-retry safety block
 		// (security relevant — write ACL). `pin` optional (overrides the config).
 		modem_sim_puk: {
-			args: { modem: '', puk: '', new_pin: '', ubus_rpc_session: '' },
+			args: { modem: '', puk: '', new_pin: '', store: false, ubus_rpc_session: '' },
 			call: (req) => defer(req, (reply) =>
-				daemon.sim_puk_unblock(req.args.modem, req.args.puk, req.args.new_pin, ok_reply(reply))),
+				daemon.sim_puk_unblock(req.args.modem, req.args.puk, req.args.new_pin, ok_reply(reply),
+					{ store: !!req.args.store })),
 		},
 
 		modem_sim_pin_verify: {
 			args: { modem: '', pin: '', ubus_rpc_session: '' },
 			call: (req) => defer(req, (reply) =>
 				daemon.sim_pin_verify(req.args.modem, req.args.pin, ok_reply(reply))),
+		},
+
+		modem_profiles: {
+			args: { modem: '', ubus_rpc_session: '' },
+			call: (req) => defer(req, (reply) =>
+				daemon.modem_profiles(req.args.modem, ok_reply(reply))),
 		},
 
 		modem_get_settings: {
@@ -206,16 +213,43 @@ export function publish(conn, daemon, log)
 		},
 
 		modem_sim_switch_slot: {
-			args: { modem: '', slot: 0, ubus_rpc_session: '' },
+			args: { modem: '', slot: 0, force: false, ubus_rpc_session: '' },
 			call: (req) => defer(req, (reply) =>
-				daemon.modem_sim_switch_slot(req.args.modem, req.args.slot, ok_reply(reply))),
+				daemon.modem_sim_switch_slot(req.args.modem, req.args.slot, ok_reply(reply),
+					{ force: !!req.args.force })),
 		},
 
 		// enable/disable the SIM PIN query (PIN lock); needs the current PIN
+		// `store`: write the PIN into the config when none is there (enable
+		// only); `force`: go past the low-retry guard (fewer than 2 attempts)
 		modem_sim_pin_lock: {
-			args: { modem: '', pin: '', enable: false, ubus_rpc_session: '' },
+			args: { modem: '', pin: '', enable: false, store: false, force: false, ubus_rpc_session: '' },
 			call: (req) => defer(req, (reply) =>
-				daemon.modem_sim_pin_lock(req.args.modem, req.args.pin, req.args.enable, ok_reply(reply))),
+				daemon.modem_sim_pin_lock(req.args.modem, req.args.pin, req.args.enable, ok_reply(reply),
+					{ store: !!req.args.store, force: !!req.args.force })),
+		},
+
+		// the last Cell Broadcast messages (read ACL: what the network told
+		// every phone in the cell)
+		modem_cell_broadcast: {
+			args: { modem: '', ubus_rpc_session: '' },
+			call: (req) => defer(req, (reply) =>
+				daemon.modem_cell_broadcast(req.args.modem, ok_reply(reply))),
+		},
+
+		// USSD: op send|cancel|status (write ACL — a code may book a tariff)
+		modem_ussd: {
+			args: { modem: '', op: '', text: '', ubus_rpc_session: '' },
+			call: (req) => defer(req, (reply) =>
+				daemon.modem_ussd(req.args.modem, req.args.op, req.args.text, ok_reply(reply))),
+		},
+
+		// change the SIM PIN; the configured PIN follows when it was the old one
+		modem_sim_pin_change: {
+			args: { modem: '', old_pin: '', new_pin: '', store: false, force: false, ubus_rpc_session: '' },
+			call: (req) => defer(req, (reply) =>
+				daemon.modem_sim_pin_change(req.args.modem, req.args.old_pin, req.args.new_pin, ok_reply(reply),
+					{ store: !!req.args.store, force: !!req.args.force })),
 		},
 
 		// eSIM management (optional wwand-esim package; reports
@@ -423,6 +457,21 @@ export function publish(conn, daemon, log)
 						reply(err ? { ok: false, ...err } : { ok: true, response: res.lines }),
 					at_to), wd);
 			},
+		},
+
+		// one raw QMI request / MBIM command (daemon.uc modem_qmi_raw /
+		// modem_mbim_raw); the watchdog outlasts the op's own timeout, which
+		// the daemon caps at 120 s
+		modem_qmi_raw: {
+			args: { modem: '', service: 0, message: 0, payload: '', timeout: 0, ubus_rpc_session: '' },
+			call: (req) => defer(req, (reply) =>
+				daemon.modem_qmi_raw(req.args.modem, req.args, ok_reply(reply)), 150000),
+		},
+
+		modem_mbim_raw: {
+			args: { modem: '', service: '', cid: 0, type: '', info: '', timeout: 0, ubus_rpc_session: '' },
+			call: (req) => defer(req, (reply) =>
+				daemon.modem_mbim_raw(req.args.modem, req.args, ok_reply(reply)), 150000),
 		},
 
 		modem_set_protocol: {

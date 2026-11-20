@@ -69,6 +69,11 @@ export const PIN_TYPE_PUK2 = 12;
 export const PIN_STATE_UNLOCKED = 0;
 export const PIN_STATE_LOCKED = 1;
 export const PIN_OP_ENTER = 0;
+export const PIN_OP_ENABLE = 1;
+export const PIN_OP_DISABLE = 2;
+export const PIN_OP_CHANGE = 3;
+export const PIN_MODE_ENABLED = 1;
+export const PIN_MODE_DISABLED = 2;
 
 // config pdp_type / auth -> MBIM enums — ONE table for both users (the
 // CONNECT path in context_mbim and the LTE attach path in modem_mbim), so
@@ -170,6 +175,12 @@ function rdy_fields(mc)
 // (mbim-enums.h, libmbim 1.32.0).
 export const REGISTER_ACTION_AUTOMATIC = 0;
 export const REGISTER_ACTION_MANUAL    = 1;
+
+// MbimRegisterMode, what a Register State reply says the modem is in — NOT
+// the action numbering above, it starts at UNKNOWN (mbim-enums.h:638-640,
+// libmbim 1.32.0)
+export const REGISTER_MODE_AUTOMATIC = 1;
+export const REGISTER_MODE_MANUAL    = 2;
 
 export const PROVIDER_STATE_HOME       = 1 << 0;
 export const PROVIDER_STATE_FORBIDDEN  = 1 << 1;
@@ -320,6 +331,18 @@ export const commands = {
 			response: { pin_type: 'u32', pin_state: 'u32', remaining_attempts: 'u32' },
 		},
 
+		// PIN List: ten MbimPinDesc { PinMode, PinFormat, PinLengthMin,
+		// PinLengthMax } (u32 each), PIN1 first (libmbim 1.32.0
+		// mbim-service-basic-connect.json:153-159); only PIN1's is read.
+		// PinMode 1 = enabled, 2 = disabled (mbim-enums.h:358-360) — the one
+		// place MBIM says whether the PIN query is on: the PIN query answers
+		// PinType NONE on an unlocked card either way (HW-read on a Huawei
+		// ME906s, 2026-11-19).
+		PIN_LIST: {
+			cid: 5,
+			response: { pin1_mode: 'u32', pin1_format: 'u32', pin1_min: 'u32', pin1_max: 'u32' },
+		},
+
 		// MbimRegisterAction (mbim-enums.h, libmbim 1.32.0)
 		REGISTER_STATE: {
 			cid: 9,
@@ -465,7 +488,28 @@ export const commands = {
 
 		IP_CONFIGURATION: {
 			cid: 15,
-			query: { session_id: 'u32' },
+			// The QUERY info buffer is the WHOLE MBIM_IP_CONFIGURATION_INFO
+			// structure, not just the session id: session id, the two
+			// availability flags, every count/offset pair and both MTUs, all
+			// zero on a query. libmbim builds exactly this — a 60-byte buffer —
+			// (mbim_message_ip_configuration_query_new, mbimcli-basic-connect.c
+			// :912, libmbim 1.32.0). A 4-byte query (session id alone) is
+			// tolerated by lenient firmware (EG06) but REJECTED with
+			// MBIM_STATUS_ERROR_INVALID_PARAMETERS (21) by the strict MediaTek
+			// T7xx — the FM350, same firmware family that forces the v3 CONNECT
+			// split (HW-observed on the DW5931e/FM350, 2026-10-30). The offset
+			// and gateway fields are plain zero u32 here (no ref/array encode);
+			// decode of the RESPONSE keeps its richer types below.
+			query: {
+				session_id: 'u32',
+				ipv4_available: 'u32', ipv6_available: 'u32',
+				ipv4_count: 'u32', ipv4_offset: 'u32',
+				ipv6_count: 'u32', ipv6_offset: 'u32',
+				ipv4_gateway_offset: 'u32', ipv6_gateway_offset: 'u32',
+				ipv4_dns_count: 'u32', ipv4_dns_offset: 'u32',
+				ipv6_dns_count: 'u32', ipv6_dns_offset: 'u32',
+				ipv4_mtu: 'u32', ipv6_mtu: 'u32',
+			},
 			response: {
 				session_id: 'u32',
 				ipv4_available: 'u32', ipv6_available: 'u32',

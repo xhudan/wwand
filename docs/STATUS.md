@@ -1,7 +1,7 @@
 # wwand — current state
 
-_State of 2026-10-29: stable **v1.7.2**, main **v1.8.0-dev**.
-63 host suites, all green (`cd tests && sh run_tests.sh` — it prints the count,
+_State of 2026-11-20: stable **v1.9.0** (feed release 2026.11.16), main **v1.10.0-dev**.
+69 host suites, all green (`cd tests && sh run_tests.sh` — it prints the count,
 which moves too often to be worth repeating here)._
 
 This file describes **what is true now**. The dated log of how it got here is
@@ -11,17 +11,435 @@ state buried at the top invites reading a months-old entry as present tense.
 
 ## Open threads (2026-10-29) — where the next session picks up
 
-- **Feed main** is at wwand `1.8.0_pre32` (4ea1d11) / luci-app-wwand
-  `1.8.0_pre4` (6d1abbc), pushed 2026-10-29, run 40889726859. **Do not push to the feed while a build
-  of the same branch runs** — a push cancels it. Feed stable release tag
-  (`scripts/release-stable.sh`) — only when asked.
+- **APDU transport `qmi_apdu` (2026-11-19, 3488705):** QMI `SEND_APDU` alone,
+  the logical channel opened / selected / closed by hand (MANAGE CHANNEL,
+  SELECT by AID), its number in the CLA — for a UIM service without a channel
+  message. Last candidate of `apdu_backend`, and the fallback of a real open
+  that an AT port without `CCHO` refuses. HW: the Chateau's Huawei E392 as the
+  IMS-only modem (wwand-ims UE: AKA over it, registered, a voice call) next to
+  the RG650E for data. **Not HW-verified: the eSIM path over it** (ISD-R,
+  no eUICC behind such a modem), and channels above 3. The E392 runs raw_ip
+  without QMAP: one PDN, one interface. The GDSP IMS PDN's path MTU is about
+  1450 and not signalled — `option mtu '1400'` there; a lower default for
+  `option ims` PDNs is not built.
+- **wwandctl SMS slots (2026-11-20, wwand#94):** `wwandctl sms` prints the part
+  list of a multi-part message (`[4,5]`, was `[  0]`); `sms-delete [SM|ME]
+  <index>[,<index>...]` sends the storage and a list, so slot 0 (real on QMI)
+  is reachable and ME is no longer deleted from SM. LuCI SMS *send* (item 3 of
+  the issue) is on the Modem Tools page (luci-app-wwand 4360b41,
+  `modem_sms_send`).
+- **Inbound SMS and Cell Broadcast, hotplug scripts (2026-11-19):** new
+  `sms_rx.uc` + `cbs.uc` — the events `sms` and `cell_broadcast`; Cell
+  Broadcast switched per `option cell_broadcast` / `list cb_channels` (default
+  the PWS channels), read before written; ubus `modem_cell_broadcast`; every
+  event also runs `/etc/hotplug.d/wwand` (hotplug-call, the event in the
+  environment). The AT engine now joins the two-line PDU URCs (`+CMT`, `+CBM`,
+  `+CDS`). The native MBIM SMS record parser takes the libmbim (record-relative)
+  PDU offset where the EG06's buffer-relative one points outside the data.
+- **USSD (2026-11-19):** new `ussd.uc` — QMI Voice (native/passthrough), native
+  MBIM USSD, `AT+CUSD`; ubus `modem_ussd` (send/cancel/status), `wwandctl
+  ussd`, LuCI Modem Tools → USSD, network-initiated ones as the `ussd` event.
+  HW: end to end over MBIM on the ME906s (GDSP SIM answers `*#100#`); the
+  Huawei takes and gives the AT string as packed GSM7 hex (`AT+CUSD` with
+  text: cme UNKNOWN). The QMI path runs on the RG502Q, but no test SIM's
+  network answers USSD there (Keepgo: Internal; RG650E Telekom: NoNetworkFound;
+  E392 GDSP: SupsFailureCase) — **a QMI reply and a QMI menu (Answer USSD)
+  are not HW-verified yet.**
+- **SIM PIN change, PIN query on/off from LuCI (2026-11-19):** new ubus
+  `modem_sim_pin_change` and `wwandctl pin-change`; `modem_sim_pin_lock` gains
+  native MBIM (PIN set ENABLE/DISABLE), `store` and `force`. Both refuse with
+  fewer than two attempts left unless forced, and a change on a card whose PIN
+  query is off is refused before anything is sent. The configured PIN follows
+  a change and a PUK entry (simops `keep_pin`, deps `store_pincode`, only while
+  the section still holds the old PIN), and a `pincode` edit no longer
+  restarts the modem or re-dials (it left `modem_sig` and `SIM_EFFECT`). LuCI:
+  Modem Tools → SIM → *SIM PIN*. Part of the ModemManager gap list (with
+  USSD, Cell Broadcast and an SMS-arrival event).
+- **MBIM commands are gated on DEVICE_SERVICES (2026-11-17):** `mbim_client`
+  reads the service list after every OPEN and refuses a command for an
+  unlisted service at once (`unsupported_service`); the MBIMEx version query,
+  the QMI passthrough and the LTE attach profile also say so in the log. Found
+  on the new MBIM test box, a ZyXEL LTE3301 with a **Huawei ME906s**
+  (root@192.168.1.1): it lists neither MBIMEx nor the passthrough and ignored
+  both, ~50 s of every bring-up; now 8 s from OPEN to CONNECTED, five boots,
+  a daemon restart (session adopted) and an ifdown/ifup clean. The box selects
+  the MBIM USB configuration itself (`/etc/hotplug.d/usb/05-huawei-mbim`, 0
+  then 3 — see gotchas.md). No attach-profile programming without MBIMEx (the
+  modem attaches with its own default).
+- **What the ME906s showed next (2026-11-18), four fixes:** the module is a
+  refit, not the LTE3301's stock one, so its board entry (`/dev/ttyUSB2`) now
+  applies only while that port exists — otherwise discovery finds the ME906s'
+  single tty, ttyUSB0, which answers AT (and carries NMEA once `AT^WPDGP`
+  starts the GPS). PACKET_STATISTICS answers all zeros, so the MBIM context
+  reads the netdev's counters instead (same latch as the QMI WDS/netdev pair)
+  — without it the zero-rx watchdog would have reset a working modem after
+  6 h. A fallback to GPRS/EDGE gave no data mode and status kept "LTE"; the
+  MBIM class mask now names HSPA/UMTS/EDGE/GSM and an RSSI-only reading is
+  filed under that generation. And `codec/mbim.uc decode_info` stops at the
+  DataBuffer, so a v1 REGISTER_STATE no longer reads the provider id as the
+  v2 `preferred_data_classes`. Vendor services: `3c83a6ed…` answers with a
+  `HUAW` signature on CIDs 1–3, `fdc22af2…` (CID 0x02000100) with `cf000000`,
+  `10e40d69…` empty, `ed19555d…` Failure — none documented, none used; no
+  service offers DSS. With AT found, the MBIM cells ladder's AT rung sent
+  the Quectel `AT+QENG` to the Huawei, got ERROR, and re-probed every 2-3 s;
+  it now reads in the vendor's dialect (`^MONSC` on Huawei, QENG on
+  Quectel/ASR or a blank manufacturer, nothing otherwise) and probes with the
+  read itself. Left: LTE attach profile without MBIMEx.
+- **Quectel temperature by sensor name (2026-11-18, ddimension/wwand#93):**
+  `atcmd_parse.parse_qtemp` took the first in-range number of a named
+  `+QTEMP` list, which on the RG500Q-EA is `qfe_wtr_pa0` (35 °C while the SoC
+  read 42–45) and on the RG650E `sdr0`. It now reports the hottest non-RF
+  sensor, the value from the second field; the unnamed `+QTEMP: a,b,c` form
+  (EG06, BG96) keeps the first value. Read on .202 (RG502Q-EA), .245
+  (RG650E), .200 (EG06), .201 (BG96).
+- **Cell locks are a dialect table (2026-11-17, ddimension/wwand#91):**
+  `cell_lock.uc` `DIALECTS` — `quectel` (AT+QNWLOCK) and `qmi` (NAS Set/Get
+  Cell Config 0x00D8/0x015A, the older 0x00AF/0x00D7, NR 0x010E/0x010F).
+  `sync` reads first and writes only what differs, sets a configured lock and
+  releases an unconfigured one, on all three backends now (QMI in
+  `config_check.validate`, MBIM/NCM after the AT init); before, MBIM and NCM
+  only ever SET a lock, blindly, from the AT init list. A modem no dialect
+  answers gets a warning. HW 2026-11-17: QMI lock set, read back over AT,
+  released, on the NR7101 (RG502Q-EA, also NR, and across a modem reset with
+  save_ctrl 1,1) and the Chateau (RG650E-EU, LTE only: it refuses the NR
+  read); EG06-E, BG96, BM806U-E1 and E392 know none of the six messages. The
+  Quectel 5G read of a lock has no enable field (`"common/5g",<pci>,…`), so
+  the old `parse_qnwlock` reading of it dropped the PCI (and showed a PCI-0
+  lock as off in the NCM telemetry); `parse_qnwlock` reads it now. The feed's `WWAND_BASE_UC` carries
+  `cell_lock.uc`. Not done: a hwtest run of the
+  whole bring-up on this tree; the status read-back (`locks`) still comes
+  from the NCM telemetry only.
+- **Release 1.9.0 (2026-11-16):** main merged into stable in wwand,
+  luci-app-wwand and luci-proto-wwand (stable's own commits were all
+  cherry-picks, so the merged tree is main's). Tags on stable: wwand
+  `v1.9.0`, luci-app-wwand `v1.9.0`, luci-proto-wwand `v1.8.0` (its own
+  count; it had skipped 1.8.0 with nothing new). Markers on main:
+  `v1.10.0-dev`, `v1.10.0-dev`, `v1.9.0-dev`. wwand-ims has its first
+  release: a `stable` branch, `v0.1.0` there and `v0.1.1` (the VRF local
+  route follows an in-place address change), `v0.2.0-dev` on main. Feed
+  stable took the package definitions from feed main (wwand-ims is new
+  there) and pins the tags; **released as feed tag `2026.11.16`**
+  (wwand 1.9.0, luci-app-wwand 1.9.0, luci-proto-wwand 1.8.0, wwand-ims
+  0.1.1). Feed main pins wwand `1.10.0_pre10`,
+  luci-app-wwand `1.10.0_pre2`, luci-proto-wwand `1.9.0_pre1`. For the release notes: the QMAP DL aggregation default of 31744
+  bytes now applies to every modem and, through the modem's echo, to the
+  host's uplink aggregation as well (`option dl_datagram_max_size`
+  overrides it per modem). **Do not push to the feed while a build of the
+  same branch runs** — a push cancels it.
+- **Pre-release review of main since v1.8.0 (2026-11-16):** five readers
+  over the diff, nothing release-blocking; fixed from it: a two-step card
+  switch of an `option iccid` interface (slot, then eSIM profile) released
+  the interface on the card read between the steps (`daemon.uc`
+  modem_sim_refresh); a stuck-offline modem the board claimed to repower
+  was left without a retry timer (`modem_init_qmi.uc`); a pushed reject
+  that cost a registered modem its registration was cleared by the
+  re-register step; `modes 'all'` hid the 5G blocker; a cancelled read no
+  longer reads as "no QMI nr5g setting"; the Foxconn FCC unlock is tried
+  once per init again and no longer walks a torn-down instance on; `RING 1`
+  no longer ends a dial; `option iccid` is 18-20 digits everywhere.
+  **Left open, by reading only, none measured:** the CLAT IPv4 call ending
+  alone takes the IPv6 interface down with it (`context.uc`
+  _connection_lost); a throttle of unknown duration is given up after
+  `hold_max` and nothing re-arms it (MBIM/NCM); a bound interface on a modem
+  whose active slot is empty answers "switching" without a bound; a bound
+  interface between redials does not hold its card (`siminventory.uc`
+  bind_holder); `datapath_rmnet_nss` child_of matches by link basename and
+  could count a mainline WWAN netdev of the same name; native MBIM
+  `option modes` is compared unmasked by the device's classes, so a list
+  naming a RAT the modem lacks is rewritten on every init; `attach_info`
+  is not marked stale across a re-init; the board's running light keeps one
+  LED lit after exit.
+- **Pushed diagnostics on QMI (2026-11-16):** the modem now reports
+  instead of being asked. NAS Network Reject (0x0068) puts the cause of a
+  refused registration into `registration_detail` at once, with domain,
+  radio interface, PLMN and — where the firmware says it — the CIoT mode
+  (`modem.uc _on_network_reject`). WDS LTE Attach Parameters (0x00C6) fills
+  `attach_info` with the APN and IP type the attach really used, plus one
+  libqmi read (0x0085) after registering. Carrier-aggregation indications
+  (LTE 0x0082/0x00C3/0x0132, NR 0x015B/0x0153/0x013F) start a read of the
+  carrier list a second later. WDS LTE attach failure (0x0103) is logged
+  and kept as `attach_info.failure`; RAB reject (0x00CF) and IPv6 prefix
+  update (0x0134) are logged only. Nothing acts on these three.
+  What was measured and what was not is in `qmi-beyond-libqmi.md`. Seen on
+  the wire (2026-11-16): 0x00C6 on the RG502Q-EA, and the three LTE
+  carrier indications on the Chateau's RG650E-EU. `attach_info` is filled
+  on the RG502Q-EA, BM806U-E1 and RG650E-EU. Not seen: a Network Reject —
+  no modem here was refused while it listened, and the BG96 (5.201) goes
+  straight to GSM without trying LTE-M — and anything NR; the NR
+  registrations are accepted by the RG650E-EU only. Not done from the same
+  list: WDS 0x00AD (remove a delegated prefix — never sent), 0x00E3 (no
+  modem here has it), and 0x00CE as a read — its causes are EMM-level
+  service-request rejects, not the ESM/SM cause of a refused dial. The MBIM
+  passthrough delivers no NAS indications, so this is QMI only.
+- **Raw QMI/MBIM from the CLI (2026-11-15):** `wwandctl qmi` and
+  `wwandctl mbim` (ubus `modem_qmi_raw` / `modem_mbim_raw`) send one request
+  and print the answer undecoded. CTL and the QMI passthrough UUID are
+  refused (never-SYNC). HW-checked 2026-11-15 on the NR7101 (RG502Q, QMI)
+  and the LTE3301-PLUS (EG06, MBIM: native commands and QMI over the
+  passthrough); the data session stayed up on both.
+- **`option ipa_mode 'ipad'` (2026-11-11, 4d283f3):** an SGP.32 card
+  with its own IPA runs it until the device sends TERMINAL CAPABILITY tag 84
+  (IDEMIA DAKOTA IoT v1.2 DEV_REQ_8); the modem never does. With the option,
+  `sim.uc declare_ipad` sends `A9 03 84 01 01` on the basic channel before
+  every ISD-R open. It is opt-in because it switches the card's IPAe off. The
+  name is not `ipa` because wwand-ipa owns that one. HW-verified on 5.202
+  (IDEMIA card, RG502Q) with a card reset each time: without the option
+  IPAe, with it IPAd and an ES10 EID read. LuCI: modem option
+  "SGP.32 IPA", and the IPAe status line points to it. Deployed there as
+  source over 1.8.0; originals in `/root/wwand-1.8.0-orig/` and
+  `/root/luci-1.8.0-orig/`. MBIM is host-tested only. **EG25-G (3.123,
+  2026-11-11):** QMI SEND_APDU without a channel id is refused with
+  ACCESS_DENIED (82), so pre13 left the card on IPAe. `declare_ipad` now
+  falls back to AT+CSIM on any transport error. On the Pi that gave IPAd,
+  EID and 4 profiles (ships in pre14; on the Pi deployed as source
+  over pre13, the original in `/root/sim.uc.pre13`). The option was removed
+  afterwards and the card is back on IPAe.
+- **Signal thresholds, parked (2026-11-13):** host-set thresholds on
+  `SIGNAL_INFO_IND` (libqmi "Config Signal Info" 0x0050 / v2 0x006C) are
+  a possible feature, not planned work. They are worth it only for a user
+  who acts on signal events, such as mwan3 failing over. The reasoning is
+  in `design/qmi-surface-survey.md`, "Open" item 4.
+- **Arcadyan AW1000 built-in profile (2026-11-12, #86):** `lte_power`
+  (tlmm 30, 1 = on) plus the two RGB lamps from #77. Reporter-tested with
+  `wwandctl repower` (WAN back after ~63 s, NSS offload intact); not tested
+  here, no AW1000 on hand. `lte_reset` stays out until its polarity is
+  measured.
+- **LED running light (2026-11-08, from #48):** the `tech` style takes
+  `sweep: true` — the technology LEDs run oldest-first every 300 ms while
+  the modem searches, on a timer of the board instance (`board.uc`
+  `self.leds`; the status tick that plans it comes every 10 s). One LED
+  blinks instead; steady over blinking over the light when entries share an
+  LED. Host-tested (`test_board` section 8) and run against the real LEDs of
+  the LTE3301 (5.201) from a /tmp board file: `#.. .#. ..#` at 300 ms, `..#`
+  once on 4G.
+- **Foxconn FCC unlock over MBIM (2026-11-09, from #75):** a T99W175 with
+  Foxconn ids (`^CUSTOMER: 6`, `105b:e0ab`) is FCC-locked in MBIM mode, and
+  wwand unlocked a Foxconn only on the QMI path. Now `modem_mbim.uc
+  radio_off` also fires when our Radio State set is refused or leaves the
+  software radio off (ModemManager's trigger, 1.24.0), and for a Foxconn
+  modem sends the DMS Foxconn FCC authentication over the passthrough: v2
+  with ModemManager's 105b magic, then v1 with 0 (`qmi_backend.uc
+  fcc_foxconn`). Host-tested (the v2 magic against the 105b shell pipeline);
+  not HW-tested — our T99W175 is not locked; mrhaav's runs locked as
+  `^CUSTOMER: 6` and has been asked to test it (#75).
+- **`option modes` on MBIM, natively (2026-11-08, from #75):** the MBIM
+  init writes the modes as the Register State `DataClass` from MBIMEx 2.0
+  on (`modem_mbim.uc sync_modes`, ModemManager's mapping, CUSTOM for the
+  class a modem names that way), over the passthrough NAS on MBIM 1.0, and
+  reports them otherwise; before, MBIM ignored `option modes` without a word.
+  The QMI and MBIM init writes of modes / PLMN / RAT order now carry a
+  permanent change duration, as the settings editor's always did. HW-read on
+  a T99W175 (HP notebook, Debian + ModemManager, 2026-11-08): CUSTOM is its
+  5G SA, the 5G_SA bit is dropped, the mask survives a modem reset, and no
+  RAT order with NR is accepted. HW-run through wwand on the same notebook
+  under OpenWrt (2026-11-08): `lte,nr5g` written as 0x80000060 and held,
+  skipped on restart and after a modem reset, `umts,lte,nr5g` restored as
+  0x8000007c. Open: the LuCI mode editor on an MBIM modem without a
+  passthrough (FM350) still has no native path. **QMI first, NSA/SA apart
+  (2026-11-12):** what CUSTOM means on a T99W175 changes with firmware AND
+  carrier profile (F0.1.0.0.9: `td-scdma, 5gnr` with GC, `lte, 5gnr` with
+  SC), and SA was off on mrhaav's modem because of `^NR5G_MODE: 1`, not
+  because of any data class bit (#75). So `sync_modes` now does what
+  ModemManager 1.24.0 does: modes over the passthrough NAS when there is
+  one, the DataClass (CUSTOM in place of its class) only without it, no
+  fallback. NSA vs SA is `option nr5g_mode` (`atcmd.uc nr5g_mode_commands`:
+  Foxconn `AT^NR5G_MODE`, Quectel `nr5g_disable_mode`), the Android split.
+  HW-run on the NR7101 (RG502Q-EA, 5.202, 2026-11-12): `nsa` wrote 1 and
+  read it back, `both` wrote 0, a matching value was only read ("already
+  set"); option removed afterwards, modem back on 0. The T99W175 side and
+  the NAS-first modes path are host-tested only (no T99W175 available,
+  mrhaav to test). hwtest -F on all reachable devices: no import or
+  runtime errors. LuCI:
+  "5G NR mode" under the modem's radio settings (luci-app-wwand). Found on the way: the forced
+  `option at_over_mbim` tunnel ran no init list at all, and its engine sent
+  setting steps as JSON; it now runs `modem_common.init_commands` through the
+  runner the tty engine uses (`atcmd.uc run_sequence`).
+- **The NR leg in the carrier list (2026-11-13, #75):** the list had only
+  LTE rows on QMI and MBIM-passthrough modems, because `GET_LTE_CPHY_CA_INFO`
+  is LTE-only. Now `qmi_backend.uc ca_with_rf` adds the primary carrier of
+  each leg the list lacks from NAS `GET_RF_BAND_INFO` (band, channel,
+  bandwidth), the way Android's `PhysicalChannelConfig` is built. It runs
+  after the CA ladder, not as a rung of it, so the RG650E keeps its
+  `AT+QCAINFO` SCCs. `AT+QCAINFO` is sent to Quectel (or an unnamed
+  manufacturer) only. Read by hand on 2026-11-13: the T99W175 answers the CA
+  info with InformationUnavailable while idle, and that is why it fell
+  through to the QCAINFO ERROR; the RG502Q-EA refuses the newer NAS NR-CA
+  messages (InvalidQmiCommand). HW-run on the T99W175 (openwrt-elitebook,
+  LTE only): no QCAINFO any more, `ca` = an LTE PCC with 10 MHz and PCI 409,
+  `serving.lte` now with bandwidth. The NR row is host-tested only, since
+  neither modem has 5G coverage here. **Its band reaches `serving.nr` too
+  (2026-11-13, later):** the reporter's T99W175 on n78 in SA showed serving
+  band 48 next to the row's n78, because `fill_serving_band` derived the band
+  from NR-ARFCN 642048, which n48 shares with n77/n78. `serving_from_ca`
+  now copies the band the modem named. Host-tested; still no 5G here.
+  **Two more from the reporter's NSA/SA data (2026-11-14):** after an
+  NSA -> SA switch `serving` still showed an LTE cell and band 48.
+  `preserve_serving` judged the carried object by whichever channel matched
+  first; the NR channel had not changed, so the LTE leg came along. It now
+  checks each leg against the new read and drops one the read lacks, and the
+  band the modem names replaces a carried-forward derived one. In NSA the
+  T99W175 lists only LTE in RF band info, so the NR band there is still
+  derived from the channel (48 for n78) and stays open. MBIM: one register
+  report while registration was lost logged "registration lost" and started
+  a registration each, until the state reached REGISTERING after the
+  preferred-list reads; a band/RAT change gave ~120. Now once per loss.
+  HW-run on the EG06 (MBIM, LTE3301-Plus): the tree before the fix logged
+  399 of them on the hwtest band change, its re-attach timed out, and the
+  MBIM error limit rebooted the box, twice; with the fix three changes and a
+  re-attach gave 4 lines and all checks passed. Stable v1.8.0 has the same
+  code. The serving fix is host-tested only (no 5G here).
+  luci-app-wwand: Modem Tools says when `option modes` will undo a radio
+  technology change at the next modem start (the reporter's "LTE gone after
+  a power cycle" was `modes 'nr5g'` re-applied).
+- **`nr5g_mode` over QMI first (2026-11-13, #75):** Qualcomm firmware
+  keeps the NSA/SA switch in the NAS system selection preference (SET TLV
+  0x2E, GET TLV 0x2B, not in libqmi), and the vendor AT commands front it.
+  `modem_common.uc apply_nr5g_mode` reads it and writes it only when it
+  differs, on QMI modems (`step_confnet_apply`) and over the MBIM passthrough
+  (`sync_modes`). AT is the fallback, and NCM keeps the AT init step. The
+  write goes WITHOUT change_duration: the RG502Q-EA refuses 0x2E next to one
+  with MissingArgument. HW-run 2026-11-13 on the RG502Q-EA (5.202) and the
+  T99W175 (openwrt-elitebook): `nsa` -> "set (QMI, was 0)", rerun -> "already
+  set", `both` -> "set (QMI, was 1)". On the RG502Q a value written over QMI
+  survived AT+CFUN=1,1. That T99W175 firmware (F0.0.0.3.0.GC.003) answers
+  `AT^NR5G_MODE?` with ERROR, so QMI is its only way. Options removed
+  afterwards, both modems back on 0. Side finding: the Chateau's RG650E
+  stands at 1 (SA off), not changed.
+- **Why 5G stays off (2026-11-13):** `status` → `nr5g`. It reports whether
+  the LTE cell offers an NSA anchor and whether the network restricts DCNR
+  (NAS System Info 0x4E/0x4F), whether EN-DC is on (NAS Get ENDC Config), and
+  the SSP nr5g_disable_mode, all read on the slow tick by `modem_common.uc
+  collect_nr5g`. The one blocker is logged once. HW-read: the RG502Q-EA and
+  the T99W175 have no anchor here. The Chateau's RG650E on Telekom has an
+  anchor, EN-DC on, but `DCNR restricted yes` (the tariff), and SA is off from
+  the factory.
+- **Throttled APN off the recovery ladder (2026-11-13):** a dial the modem
+  ends with internal 209/211/258 ("PDN ... call throttled") no longer counts
+  toward the ladder. The retry waits for the time the modem reports (WDS Get
+  PDN Throttle Info, libqmi 1.38). Status `contexts.<n>.throttle`. QMI only.
+  Seen in the field on the BG96 (5.201) with an NB-IoT card: 8 throttled
+  dials walked the ladder toward a modem reset. Host-tested (test_daemon,
+  test_qmi_backend). Not HW-triggered with the new code, because the BG96
+  then lost LTE-M service and fell to GSM, where the card is refused with SM
+  cause 33 (counted, correctly). Its iotopmode is now 2 (LTE-M + NB-IoT,
+  was 0) and nwscanseq 030201.
+- **A control device before its netdev (2026-11-08):** after a modem reset
+  the T99W175 (mhi-pci-generic) announces `wwan0mbim0` before its netdev;
+  the modem was started without one, the netdev kept its kernel name and
+  the interface stayed down until a wwand restart. `start_modem` now waits
+  for the netdev (`NETDEV_SETTLE`, 15 s; its hotplug add starts the modem,
+  the waiting tick retries at that bound) and only then starts without one;
+  a control device that leaves ends the wait. HW-verified: reset -> wait ->
+  rename to `wwand0` -> connected, no restart.
+- **SIM card per interface, `option iccid` (2026-11-07, from #39):** an
+  ifup on a modem running another card takes one step towards it — slot
+  switch or eSIM profile enable (`siminventory.uc bind_plan`) — and dials
+  once the modem registered on it; refused while another interface bound to
+  a different card uses the modem (first come wins, `bind_holder`); a card
+  change under a bound interface takes it down (`daemon.uc sim_release`);
+  manual slot switches / eSIM enable-disable answer `sim_in_use` unless
+  `force`; the bring-up asserts the bound card's slot instead of `sim_slot`
+  (`sim.uc boot_slot`). LuCI: "SIM card" on the interface form
+  (luci-proto-wwand, choices from sim_inventory), error codes, status-page
+  row, the slot buttons ask before forcing (luci-app-wwand), `sim_slot` help
+  amended. HW-verified on the NR7101 (RG502Q-EA, two cards, 2026-11-07):
+  refusal while the other card's interface is up; `ifup` switching slot 2 ->
+  1 and back, the way back registering and dialling 14 s after the ifup;
+  `wwandctl slot` refused under a bound interface, `--force` releasing it;
+  the boot slot following the bound card. Three faults found there and fixed
+  before this commit: the reconnect path dialled the new interface before
+  its card was read, the attach profile took the APN of the interface bound
+  to the other card, and an ifdown left the switch holding the modem. The
+  slot-1 card itself gets no service there (EMM detached / not subscribed),
+  so a dial on it could not be shown. LuCI form and status row checked on
+  the same box (luci-app/-proto from the working trees; the box keeps them).
+- **Stuck offline (2026-11-07):** the RPi4's EG25-G (192.168.3.123) was
+  left offline by a recovery modem reset it acknowledged and never performed,
+  and from offline refused every mode but reset (INVALID_TRANSITION) — the
+  ladder then climbed towards a reboot that does not cut its USB power. The
+  QMI bring-up now leaves a refused online through the mode's way out
+  (offline: reset; else low power first) and says *stuck offline* instead of
+  climbing; an acknowledged admin/ladder reset is watched for the modem
+  staying offline on the bus (`modem_init_qmi.uc reset_out_of_offline`,
+  `modem.uc watch_reset`, gotchas.md). HW-verified on the Pi (2026-11-07,
+  main + this change via hwtest): online refused → "resetting it" → 30 s
+  later "stuck offline … retrying the reset in 600 s", `control_note` set,
+  state SET_OPMODE, the attempt counter stays (9) — no ladder. wwand keeps
+  running there; the modem itself still needs a physical power cycle. Seen
+  on the way: after ~10 h offline its QMI stopped answering altogether (CTL
+  alloc and SYNC time out, AT still CFUN 7); a hub-port disable/enable
+  (`1-1-port1/disable`) brought QMI back after ~130 s, still offline. The MBIM passthrough reset (`modem_mbim.uc reset`) has the same
+  offline → reset shape and is not covered yet. The Pi's SIM (Vodafone IoT
+  profile) is rejected on LTE (CEER 6,259) and was roaming-blocked on 2G
+  (roaming_preference now 255) — separate thread.
+- **LED styles `tech` and `signal_color` (#77, 2026-11-05):** a board
+  file's `leds` may be a list of entries. `tech` lights one LED per
+  generation (2G..5G, `cumulative` or one at a time for an RGB lamp,
+  per-LED `weak` = on/blink/off at or below `weak_bars`, optional `signal`
+  and `searching` LEDs); `signal_color` shows the bars as the colour of one
+  RGB or red/green LED. The daemon tick hands the generation over as `gen`
+  (`board.uc generation`: 5G NSA from rat_fine). LEDs are written only when
+  they change. Host-tested with the Xunison D50 and AW1000 files from the
+  issue; no test device has such a panel, so HW is the reporters' (4IceG,
+  kuncy7). The sweep (#48) is built (`board.uc` `SWEEP`); not built: the LuCI
+  LED page.
+- **rmnet_nss after a restart (#78, 2026-11-05):** the probe needed a
+  `<parent>_1`, which the first start had renamed to `wwandN`, so a restart
+  fell back to a datapath that cannot serve `qmi_wwan_q` and looped on
+  `mux_backend_unavailable`; the adoption's exact-MAC check refused the
+  XT-Martinez driver's MAC + n children. Both now ask the sysfs parent link
+  (`datapath_rmnet_nss.uc child_of`, see gotchas.md); a `qmi_wwan_q` parent
+  with any child is claimed. HW-verified on the NR7101 (RG502Q-EA,
+  2c7c:0800, which the driver gives `use_rmnet_usb`) with `qmi_wwan_q` 1.5.0
+  from the XT feed, built for its 6.18.55 kernel in
+  `/vol/release/nr7101/openwrt-ci` (upstream 116414a + the CI LTE-power
+  patch), `qmap_mode=2`: the old code fell back to `rmnet` on the restart and
+  looped, the fix adopted `wwand0`/`wwand1` (MAC + n, `device` -> `wwan0`) on
+  two restarts, the second taking over the live session. To set it up again:
+  stop wwand, unbind `2-1:1.4` from `qmi_wwan`, `insmod qmi_wwan_q.ko
+  qmap_mode=2`. Back to `qmi_wwan` (bind `2-1:1.4`) the modem needed a
+  `modem_reset` before usbnet sent again (tx_errors, rx 0; 2026-11-05).
+- **QMAP DL aggregation default 31 KB (#79, 2026-11-05):** the per-model and
+  per-board size tables are gone; every modem is asked for 31744 bytes and
+  may clamp it (its echo sizes the receive side). 31 KB, not ModemManager's 32 KB, because the receive skb
+  of 32768 + overhead needs a 64 KB allocation (netlink.uc
+  `DEFAULT_DGRAM_SIZE`). New optional datapath entry `dgram_max`: the vendor
+  datapaths (rmnet_nss, rmnet_nss_mhi) cap the request at the driver's fixed
+  buffer. Measured by kuncy7 on an RG500Q-EA: CPU0 per 100 Mbit/s 10.9 % ->
+  7.6 %.
+- **Watchdog reset order (#76, 2026-11-02):** the zero-rx / TX-stall
+  watchdog (`modem_common.trip_zero_rx`) went straight to the board repower
+  where the board had one — a GPIO reset or power cut, skipping the modem's
+  own reset. It now resets the modem first, as `modem_reset` does, and the
+  board repowers only when that reset is refused or the modem is still on the
+  bus after `reset_fallback` (default 30 s). Reported by marcinnet-25 on a
+  Zyxel LTE7480-M804 (reset GPIO).
+- **RAT priority (#75, built and HW-tested 2026-10-30):** `option rat_order`
+  + `modem_get/set_settings` `rat_order` (+ `rat_order_writable`,
+  `not_applied`) + LuCI Modem Tools *RAT priority* editor and the modem-page
+  option; the `rat_order` config warning flags a supported RAT missing from
+  the acquisition order (QMI validate pass and MBIM init alike). MBIM has no
+  native order, so MBIM goes through the passthrough (reference.md "RAT
+  priority"). hwtest `ratorder` checks + func and a CDP GUI test passed on
+  every listed device but the blocked X3000 (Chateau read-only); every
+  order was put back and compared. Firmware findings, all handled: the BG96
+  lists eMTC/NB-IoT as NONE slots and refuses them (order then read-only);
+  the EG06 over MBIM accepts an order and drops it at the next radio cycle
+  (`not_applied`). Same run: hwtest `stage.sh` had been making `/usr`,
+  `/etc`, `/lib` on every device non-root and 0775 — fixed, devices
+  repaired (gotchas.md, tar entry).
 - **TX-stall watch (built 2026-10-29, after pre30):** the daemon tick reads the
   kernel's `tx_timeout` count of each modem's data netdev, reports `tx_stall`
   in status (LuCI "TX stalls"), and a stall lasting `tx_stall_timeout`
-  (default 120 s, 0 = watch only) takes the zero-rx recovery, only while a session of that modem is up. Not yet seen on
-  hardware: the first real NETDEV WATCHDOG on a test box is the check that the
-  counter moves the way `context_common.tx_stall_watch` assumes (re-firing
-  every ~5 s while the queue stays stopped).
+  (default 120 s, 0 = watch only) takes the zero-rx recovery, only while a session of that modem is up. First seen on
+  hardware by marcinnet-25 (#72, Quectel EG12, pre31, 2026-10-29): the stall
+  was detected and tripped at his 60 s, but the counter re-fired every ~30-35 s,
+  not every ~5 s, and the reset went over AT (QMI no longer answered), where
+  `modem_common.at_reset` threw `access to undeclared variable guard` (in every
+  release since 3a1fcc4, 2026-10-01, stable included). Fixed on main and
+  HW-checked on the NR7101 (real engine, real CFUN=1,1, one callback);
+  on stable as f25bcdc (cherry-pick, in v1.8.0 and v1.9.0). The trip line no longer claims "the control
+  channel kept answering" — `proto_errors` is a streak reset by any answer.
 - **Fork branches for the device images** (ddimension/openwrt): `chateau-ci`,
   `lte3301`, `nbg7815-update` rebased onto openwrt main and **pushed 2026-10-24**
   (backups `*-pre-rebase-2026-10-24`); openwrt/openwrt#24881 is now its two
@@ -34,7 +452,7 @@ state buried at the top invites reading a months-old entry as present tense.
   the built-in entry; an invalid file is ignored whole and logged, status
   `board.profile_source` names the winner. hwtest `boardfile` (func.sh) passed on
   the Cudy, NR7101, LTE3301, LTE3301-PLUS and -M209. micw's 2G/3G/4G sweep panel
-  would be a third LED style — build it with his board PR. MayorBug told on #50.
+  is the third LED style (`board.uc` `SWEEP`). MayorBug told on #50.
 - **Issues waiting on reporters:** luci-app-wwand#16 (mrhaav — `BB3` band fixed
   in pre30; the eNodeB/sector row built 2026-10-29, luci-app-wwand 6d1abbc,
   checked on the Chateau), #73 (i18n
@@ -49,7 +467,7 @@ state buried at the top invites reading a months-old entry as present tense.
   closed.
 - **PRs:** #50 (MayorBug, draft, conflicts) waiting on a rework. #60 and #65
   (xhudan) merged with follow-ups.
-- **Upstream:** openwrt/packages#30185 (pins 1.6.9; maintainer review
+- **Upstream:** openwrt/packages#30185 (pins 1.9.0; maintainer review
   CHANGES_REQUESTED since 08-07; the bot's oldest open point — unversioned
   `+ucode` — is answered by the #67 floor once the PR is updated, which is done
   only on request), openwrt/luci#8917 (no maintainer review yet).
@@ -78,11 +496,11 @@ is always user-triggered.
 
 | | |
 |---|---|
-| Packages | `wwand` (base, no backend) + `wwand-qmi` / `-mbim` / `-ncm` / `-mhi` / `-esim`, plus two optional datapath add-ons in the feed. Plugins in their own repositories: `wwand-ipa` (SGP.32 eIM), `wwand-qlog` (Quectel QLog diag capture), `wwand-rsim` (remote SIM: readers, phones over Bluetooth SAP, other modems' cards) |
+| Packages | `wwand` (base, no backend) + `wwand-qmi` / `-mbim` / `-ncm` / `-mhi` / `-esim` / `-gps` / `-apntest`, plus two optional datapath add-ons in the feed. Plugins in their own repositories: `wwand-ipa` (SGP.32 eIM), `wwand-qlog` (Quectel QLog diag capture), `wwand-rsim` (remote SIM: readers, phones over Bluetooth SAP, other modems' cards), `wwand-ims` (VoLTE / IMS for a LAN SIP phone) |
 | Datapath | one plug-in interface (`docs/datapath-interface.md`): built-ins `rmnet`, `qmimux`, `vlan` (MBIM), pseudo-modes `raw_ip` and `ethernet` (802.3, WDA-less QMI stacks); add-ons `rmnet_nss`, `rmnet_nss_mhi` |
 | QMAP | negotiated down a ladder v5 → v4 → v1, capped by `option qmap_version` |
-| Feed | ddimension/openwrt-repo, two independent lines — stable (releases, published only by a date tag; last: 2026.10.20 with wwand 1.7.1, 1.7.2 built but not yet released) and main (development, `1.8.0_preN` from the `v1.8.0-dev` marker). The source repos have the same two lines (`stable` at v1.7.2). `wwand` requires `ucode (>=` the SDK's ucode `)` since #67 |
-| Upstream | openwrt/packages#30185 (pins v1.6.9), openwrt/luci#8917 |
+| Feed | ddimension/openwrt-repo, two independent lines — stable (releases, published only by a date tag; last: 2026.11.16 with wwand 1.9.0) and main (development, `X.Y.Z_preN` from the `vX.Y.0-dev` marker, now `v1.10.0-dev`). The source repos have the same two lines (`stable` at v1.9.0). `wwand` requires `ucode (>=` the SDK's ucode `)` since #67 |
+| Upstream | openwrt/packages#30185 (pins v1.9.0), openwrt/luci#8917 (luci-app-wwand v1.9.0, luci-proto-wwand v1.8.0, plus two later main commits) |
 
 ## Hardware verified (2026-10-24, main 3a12e9e, `hwtest/run.sh`)
 
@@ -96,10 +514,13 @@ The test devices are those in the workspace's `test-devices.txt`, nothing else.
 | ZyXEL LTE3301-PLUS (5.200) | EG06-E, **MBIM** (switched from QMI 2026-10-24) | daemon clean, but no registration with its SIM (`+EMM ERROR 1,15`); UIM Remote switched on |
 | Cudy LT300 v3 (3.113) | SLM770A-R, NCM | connected; reattach |
 | GL.iNet GL-X3000 (3.93) | RM520N-GL, QMI + E392 | blocked by other tests; UIM Remote already on |
+| HP EliteBook 850 G7 (openwrt-elitebook, x86_64) | Dell DW5932e / Foxconn T99W373, **PCIe/MHI** (`mhi-pci-generic`, `wwand-mhi`), MBIM + QMI passthrough | connected 5G NSA (ENDC); RAT priority read and in LuCI (2026-10-30, main f3f3a6a); eUICC in slot 2 listed; UIM Remote on via `AT^EFS`; borrows the NR7101's card over SSH (`donor_cond none`, the RG502Q refuses the condition TLV); the slot needs `kmod-hp-elitebook-850-g7-wwan-unlock` |
+| HP EliteBook 850 G7 (openwrt-elitebook, x86_64) | Dell DW5931e / Fibocom FM350-GL (MediaTek T7xx, PCI `14c3:4d75`, `kmod-mtk-t7xx`), firmware 81600.0000.00.29.23.06_GC, **native MBIM** (MBIMEx 3.0, no QMI passthrough: `NoDeviceSupport`) | 2026-10-31, main f2c804f: FCC lock released by GTFCCLOCK (06f51e0); connected, ping 3/3, 5G SA on o2-de; IP config needs the full 60-byte query (7e4e5d8); CA over `AT+GTCAINFO?` (4e1d62d); eUICC (SGP.22 2.2.2) and APDU over MBIM; no RAT priority or NAS settings, which need the passthrough (`unsupported_on_backend`) |
 
-Snapshot devices run ucode 2026.07.09 (libucode ABI 20230711), so the feed's
-current snapshot packages do not install there (the #67 floor); hwtest deploys
-the ucode tree as source over each device's own `wwand_io.so`.
+Snapshot images here carry ucode 2026.10.x; the #67 floor ties the feed's
+snapshot packages to the SDK's ucode, so on an image older than that they do
+not install, and hwtest deploys the ucode tree as source over each device's own
+`wwand_io.so`.
 
 ## Multi-SIM: what the hardware here actually is
 
@@ -394,7 +815,7 @@ place to check. One line each, with its opening sentence:
    `tools/check-anchors.py --since <the commit before it> --fix` once.
 5. **Two lines (since 2026-10-04):** releases are tagged on the `stable` branch,
    never on main; main carries the `vX.Y.0-dev` marker of the minor it develops
-   (currently `v1.7.0-dev`) and ships as `X.Y.Z_preN` on feed main. A patch
+   (currently `v1.9.0-dev`) and ships as `X.Y.Z_preN` on feed main. A patch
    release: get the fix onto `stable` (cherry-pick `-x` from main, or fix on
    stable and merge stable into main), run 1-4 there, tag `vX.Y.Z` on stable —
    in luci-app-wwand / luci-proto-wwand only where they changed. Opening a new

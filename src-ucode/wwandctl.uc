@@ -9,7 +9,9 @@
 'use strict';
 
 import { fmt_plmn, fmt_sig, fmt_locks, reg_text, packet_service_text,
-	collectd_lines, collectd_interval, recovery_text, radio_text, select_args, euicc_text } from 'wwand.wwandctl_fmt';
+	collectd_lines, collectd_interval, recovery_text, radio_text, select_args, euicc_text,
+	raw_num, qmi_service_id, qmi_raw_payload, qmi_raw_text, mbim_raw_text,
+	sms_slots, sms_delete_args } from 'wwand.wwandctl_fmt';
 
 import * as libubus from 'ubus';
 import * as fs from 'fs';
@@ -149,6 +151,18 @@ function cmd_status(args)
 		if (ps_line)
 			printf('  5g          %s\n', ps_line);
 
+		// the cell's 5G NSA offer and what the modem makes of it; the held line
+		// only when something keeps an LTE link off it
+		if (m.nr5g) {
+			let yn = (v) => (v == null) ? '?' : (v ? 'yes' : 'no');
+			printf('  nr5g        anchor %s · EN-DC %s · DCNR restricted %s · off: %s\n',
+				yn(m.nr5g.nsa_available), (m.nr5g.endc_enabled == null) ? '?' : (m.nr5g.endc_enabled ? 'on' : 'off'),
+				yn(m.nr5g.dcnr_restricted), m.nr5g.disabled ?? '?');
+
+			if (m.nr5g.blocker)
+				printf('  nr5g held   %s\n', m.nr5g.blocker);
+		}
+
 		if (m.temperature?.celsius != null)
 			printf('  temp        %d °C\n', m.temperature.celsius);
 
@@ -216,6 +230,18 @@ function cmd_status(args)
 		printf('  state       %s%s\n', c.state,
 			c.last_error ? sprintf('  [last error: %s %s]',
 				c.last_error.stage ?? '', c.last_error.text ?? c.last_error.code ?? '') : '');
+
+		// the modem holds the APN back after network rejections: no dial
+		// until this runs out, and none of it counts toward recovery
+		if (c.throttle)
+			printf('  throttled   APN "%s" held back by the modem%s\n', c.throttle.apn ?? '',
+				(c.throttle.seconds_left != null) ? sprintf(', %d s left', c.throttle.seconds_left) : '');
+
+		// option iccid: the card it needs, and where its switch stands
+		if (c.sim)
+			printf('  sim         card %s%s%s\n', c.sim.want ?? '?',
+				c.sim.state ? sprintf('  [%s]', c.sim.state) : '',
+				c.sim.reason ? sprintf('  %s', c.sim.reason) : '');
 
 		let s = (c.state == 'CONNECTED')
 			? call('context_settings', { context: name })?.settings : null;
@@ -285,8 +311,24 @@ function cmd_puk(st, args)
 	let res = call_ok('modem_sim_puk', { modem: r.modem, puk: rest[0], new_pin: rest[1] });
 
 	printf('SIM unblocked via %s. New PIN set.\n', res.via ?? '?');
-	printf('NOTE: update the configured pincode (uci set network.%s.pincode=...) to the new PIN.\n',
-		r.modem);
+	pin_config_note(res.config);
+}
+
+// what happened to the configured PIN after a PIN operation (simops keep_pin)
+function pin_config_note(c)
+{
+	if (c == null)
+		return;
+
+	if (c.updated)
+		printf('the configured PIN on %s was updated\n', c.section);
+	else if (c.reason == 'configured_pin_differs' || c.reason == 'changed')
+		printf('NOTE: %s configures a different PIN; it was left as it is\n', c.section ?? '?');
+	else if (c.reason == 'none_configured')
+		printf('NOTE: no PIN is configured; set one (uci set network.%s.pincode=...) if the card asks for it at start\n',
+			c.section ?? '?');
+	else if (c.reason != 'unchanged')
+		printf('NOTE: the configured PIN was not updated (%s)\n', c.reason ?? '?');
 }
 
 function cmd_sms(st, args)
@@ -298,7 +340,8 @@ function cmd_sms(st, args)
 	let res = call_ok('modem_sms_list', { modem: r.modem, storage: storage });
 
 	for (let m in (res.messages ?? []))
-		printf('[%3d] %s  %s\n      %s\n', m.index, m.timestamp ?? '-', m.sender ?? '?',
+		printf('[%3s] %s  %s%s\n      %s\n', sms_slots(m), m.timestamp ?? '-', m.sender ?? '?',
+			m.incomplete ? sprintf('  (%d of %d parts)', length(m.indexes ?? []), m.parts ?? 0) : '',
 			m.text ?? '');
 
 	if (!length(res.messages ?? []))
@@ -370,7 +413,9 @@ function cmd_esim(st, args)
 	}
 
 	case 'download-status': {
-		let res = call_ok('modem_esim', { modem: r.modem, op: op });
+		// the bridge's op is spelled with an underscore (esim_bridge.uc
+		// download_status); the CLI keeps the hyphen of its other commands
+		let res = call_ok('modem_esim', { modem: r.modem, op: 'download_status' });
 		printf('state: %s%s\n', res.state ?? '?', res.via ? sprintf(' via %s', res.via) : '');
 		if (length(res.log ?? ''))
 			printf('%s\n', res.log);
@@ -435,15 +480,21 @@ Connection
 
 SIM
   pin [modem] [pin]      manual PIN release past the low-retry safety block
-  pin-lock [modem] <pin>     enable the SIM PIN query
+  pin-lock [modem] <pin> [--store]  enable the SIM PIN query
+                             (--store: keep the PIN in the config)
   pin-unlock [modem] <pin>   disable the SIM PIN query
+  pin-change [modem] <old> <new>  change the SIM PIN; the configured
+                             PIN follows when it was the old one
   puk [modem] <puk> <new-pin>  unblock a PUK-locked SIM and set a NEW PIN
-  slot [modem] <n>       switch the active physical SIM slot
+  slot [modem] <n> [--force]  switch the active physical SIM slot
+                         (--force: also under an interface bound to the card in use)
 
 SMS
   sms [modem] [SM|ME]    list stored messages
   sms-send [modem] <number> <text...>   send an SMS
-  sms-delete [modem] <index>
+  sms-delete [modem] [SM|ME] <index>[,<index>...]   delete the slots "sms" lists
+  ussd [modem] <code|answer>  send a USSD code, or answer the network's question
+  ussd-cancel [modem]        end the USSD session
 
 eSIM (needs the wwand-esim package)
   esim [modem] profiles                  list installed profiles
@@ -456,12 +507,20 @@ eSIM (needs the wwand-esim package)
 
 Maintenance
   sims                   every SIM card seen: ICCID, where it is (modem/slot, eUICC profile, reader)
-  reset [modem]          modem reset (GPIO if configured, else backend soft reset)
+  reset [modem]          modem reset (its own reset first; the reset GPIO only as the fallback)
   repower [modem]        hardware repower (reset-GPIO pulse / board power-cycle)
   protocol [modem] qmi|mbim   switch the control protocol (the modem resets)
   plmn-set [modem] <user|nas|fplmn> <mccmnc>[+gsm,+utran,...] ...
   plmn-restore [modem]   re-apply the configured PLMN list ("restore now")
   at [modem] <command>   raw AT command on the modem's AT port
+  qmi [modem] <service> <message> [TYPE=HEX ...]   one raw QMI request
+                         (service by name or number, message id in hex or
+                         decimal, each TLV as TYPE=HEX); prints the result
+                         and the response TLVs. CTL is refused
+  mbim [modem] query|set <service> <cid> [HEX]   one raw MBIM command
+                         (service by name, e.g. basic_connect, or UUID);
+                         prints the status and the InformationBuffer.
+                         Both take --timeout <s> (default 10, max 120)
   migrate [apply]        plan (default) or apply config migration to proto wwand
   reload                 re-read UCI and apply the diff
   log-level <level>      err|warn|notice|info|debug (until next reload)
@@ -538,7 +597,7 @@ if (json_mode) {
 //
 // WHY THE FLOOR. `modem_signal` keeps wwand's adaptive fast-telemetry loop warm
 // (daemon.uc calls modem.watch()); that loop polls the modem at 1 Hz and decays
-// 6 s after the last request (modem_common.uc:1175, :1041). One sample therefore
+// 6 s after the last request (modem_common.uc:1317, :1041). One sample therefore
 // costs ~6 s of 1 Hz modem traffic, so the duty cycle is 6/interval: 10 % at
 // 60 s, 20 % at 30 s, 60 % at 10 s — and at 6 s or below the loop NEVER decays
 // and the modem is polled around the clock. A global `Interval 10` in
@@ -612,6 +671,29 @@ function cmd_collectd(argv)
 
 		sleep(interval * 1000);
 	}
+}
+
+// `--timeout <s>` anywhere after the command, taken out of the list:
+// the remaining arguments are positional
+function raw_timeout_arg(list)
+{
+	let rest = [], ms = 0;
+
+	for (let i = 0; i < length(list); i++) {
+		if (list[i] != '--timeout') {
+			push(rest, list[i]);
+			continue;
+		}
+
+		let s = raw_num(list[++i]);
+
+		if (s == null || s < 1 || s > 120)
+			die('--timeout takes seconds, 1..120');
+
+		ms = s * 1000;
+	}
+
+	return { rest: rest, timeout: ms };
 }
 
 switch (cmd) {
@@ -716,10 +798,14 @@ case 'slot': {
 	let r = resolve_modem(st, args[0]);
 	let rest = r.consumed ? slice(args, 1) : args;
 
-	if (!(+rest[0] > 0))
-		die('usage: wwandctl slot [modem] <n>');
+	let force = index(rest, '--force') >= 0;
 
-	let res = call_ok('modem_sim_switch_slot', { modem: r.modem, slot: +rest[0] });
+	rest = filter(rest, (a) => a != '--force');
+
+	if (!(+rest[0] > 0))
+		die('usage: wwandctl slot [modem] <n> [--force]');
+
+	let res = call_ok('modem_sim_switch_slot', { modem: r.modem, slot: +rest[0], force: force });
 	printf(res.unchanged ? 'slot %d already active\n' : 'switched to slot %d\n', +rest[0]);
 	break;
 }
@@ -922,16 +1008,34 @@ case 'pin': {
 case 'pin-lock':
 case 'pin-unlock': {
 	let st = status();
+	let store = ('--store' in args);
+	let a = filter(args, (x) => x != '--store');
+	let r = resolve_modem(st, a[0]);
+	let rest = r.consumed ? slice(a, 1) : a;
+
+	if (!length(rest[0] ?? ''))
+		die(sprintf('usage: wwandctl %s [modem] <pin>%s', cmd, (cmd == 'pin-lock') ? ' [--store]' : ''));
+
+	let res = call_ok('modem_sim_pin_lock',
+		{ modem: r.modem, pin: rest[0], enable: (cmd == 'pin-lock'), store: store });
+	printf('SIM PIN query %s%s\n', (cmd == 'pin-lock') ? 'enabled' : 'disabled',
+		res.already ? ' (was already)' : '');
+	pin_config_note(res.config);
+	break;
+}
+
+case 'pin-change': {
+	let st = status();
 	let r = resolve_modem(st, args[0]);
 	let rest = r.consumed ? slice(args, 1) : args;
 
-	if (!length(rest[0] ?? ''))
-		die(sprintf('usage: wwandctl %s [modem] <pin>', cmd));
+	if (!length(rest[0] ?? '') || !length(rest[1] ?? ''))
+		die('usage: wwandctl pin-change [modem] <old pin> <new pin>');
 
-	let res = call_ok('modem_sim_pin_lock',
-		{ modem: r.modem, pin: rest[0], enable: (cmd == 'pin-lock') });
-	printf('SIM PIN query %s%s\n', (cmd == 'pin-lock') ? 'enabled' : 'disabled',
-		res.already ? ' (was already)' : '');
+	let res = call_ok('modem_sim_pin_change',
+		{ modem: r.modem, old_pin: rest[0], new_pin: rest[1] });
+	printf('SIM PIN changed\n');
+	pin_config_note(res.config);
 	break;
 }
 
@@ -942,6 +1046,30 @@ case 'puk':
 case 'sms':
 	cmd_sms(status(), args);
 	break;
+
+case 'ussd':
+case 'ussd-cancel': {
+	let st = status();
+	let r = resolve_modem(st, args[0]);
+	let rest = r.consumed ? slice(args, 1) : args;
+
+	if (cmd == 'ussd-cancel') {
+		call_ok('modem_ussd', { modem: r.modem, op: 'cancel' });
+		printf('USSD session ended\n');
+		break;
+	}
+
+	if (!length(rest))
+		die('usage: wwandctl ussd [modem] <code|answer>   e.g. wwandctl ussd "*100#"');
+
+	let res = call_ok('modem_ussd', { modem: r.modem, op: 'send', text: join(' ', rest) });
+
+	printf('%s\n', res.reply ?? '(no text)');
+
+	if (res.action_required)
+		printf('-- the network asks for a reply: wwandctl ussd <answer>, or ussd-cancel\n');
+	break;
+}
 
 case 'sms-send': {
 	let st = status();
@@ -963,11 +1091,27 @@ case 'sms-delete': {
 	let r = resolve_modem(st, args[0]);
 	let rest = r.consumed ? slice(args, 1) : args;
 
-	if (rest[0] == null)
-		die('usage: wwandctl sms-delete [modem] <index>');
+	let req = sms_delete_args(r.modem, rest);
 
-	call_ok('modem_sms_delete', { modem: r.modem, index: +rest[0] });
-	printf('message %d deleted\n', +rest[0]);
+	if (!req)
+		die('usage: wwandctl sms-delete [modem] [SM|ME] <index>[,<index>...]');
+
+	// a list reply says ok: false when any slot failed, next to what did go
+	// (sms.sms_delete) — that is reported per slot, not as one error
+	let res = call('modem_sms_delete', req);
+
+	if (res.ok === false && type(res.failed) != 'array')
+		die(sprintf('modem_sms_delete failed: %s', res.error ?? 'unknown error'));
+
+	printf('%s: deleted %d of %d slot%s\n', req.storage, res.deleted ?? 0, res.requested ?? length(req.indices),
+		(length(req.indices) == 1) ? '' : 's');
+
+	for (let f in (res.failed ?? []))
+		printf('  slot %d: %s%s\n', f.index, f.error?.error ?? sprintf('%J', f.error),
+			f.error?.detail ? sprintf(' %J', f.error.detail) : '');
+
+	if (length(res.failed ?? []))
+		exit(1);
 	break;
 }
 
@@ -1026,6 +1170,69 @@ case 'at': {
 
 	for (let l in (res.response ?? []))
 		printf('%s\n', l);
+	break;
+}
+
+case 'qmi': {
+	// a modem may share a name with a service: the first word is taken as
+	// the modem only when what follows still makes a request, and with a
+	// single modem a line that is a request as it stands is read as one
+	let st = status();
+	let o = raw_timeout_arg(args);
+	let bare = qmi_service_id(o.rest[0]) != null && raw_num(o.rest[1]) != null;
+	let prefixed = length(o.rest) >= 3 &&
+		qmi_service_id(o.rest[1]) != null && raw_num(o.rest[2]) != null;
+	let named = (length(keys(st.modems)) > 1) ? (prefixed ? o.rest[0] : null)
+		: ((prefixed && !bare) ? o.rest[0] : null);
+	let r = resolve_modem(st, named);
+	let a = r.consumed ? slice(o.rest, 1) : o.rest;
+
+	if (length(a) < 2)
+		die('usage: wwandctl qmi [modem] <service> <message> [TYPE=HEX ...] [--timeout s]');
+
+	let svc = qmi_service_id(a[0]);
+	let msg = raw_num(a[1]);
+	let p = qmi_raw_payload(slice(a, 2));
+
+	if (svc == null)
+		die(sprintf('unknown QMI service %J — a name (nas, dms, uim, ...) or a number', a[0]));
+	if (msg == null)
+		die(sprintf('%J is not a message id (0x0024, 36)', a[1]));
+	if (p.error)
+		die(p.error);
+
+	let res = call_ok('modem_qmi_raw', { modem: r.modem, service: svc, message: msg,
+		payload: p.payload, timeout: o.timeout });
+
+	printf('%s\n', qmi_raw_text(res));
+	break;
+}
+
+case 'mbim': {
+	// as for qmi: `query`/`set` decides whether a modem was named
+	let st = status();
+	let o = raw_timeout_arg(args);
+	let named = (o.rest[1] == 'query' || o.rest[1] == 'set');
+	let r = resolve_modem(st, named ? o.rest[0] : null);
+	let a = r.consumed ? slice(o.rest, 1) : o.rest;
+
+	if (length(a) < 3 || (a[0] != 'query' && a[0] != 'set'))
+		die('usage: wwandctl mbim [modem] query|set <service> <cid> [HEX] [--timeout s]');
+
+	let cid = raw_num(a[2]);
+	let info = lc(replace(join('', slice(a, 3)), /[: ]/g, ''));
+
+	// ubus carries an integer argument as int32 and refuses a larger one
+	// before the daemon sees it, with an error that reads like a dead daemon
+	if (cid == null || cid < 1 || cid > 0x7fffffff)
+		die(sprintf('%J is not a command id (1..0x7fffffff)', a[2]));
+	if (!match(info, /^([0-9a-f]{2})*$/))
+		die('the InformationBuffer is not whole bytes of hex');
+
+	let res = call_ok('modem_mbim_raw', { modem: r.modem, type: a[0], service: a[1], cid: cid,
+		info: info, timeout: o.timeout });
+
+	printf('%s\n', mbim_raw_text(res));
 	break;
 }
 

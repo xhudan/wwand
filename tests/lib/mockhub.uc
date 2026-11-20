@@ -192,6 +192,22 @@ export function create(opts)
 		if (handler == null && entry.name == 'SET_PREFERRED_NETWORKS')
 			handler = {};
 
+		// built-in WDS defaults: every QMI bring-up registers the modem-wide
+		// WDS indications and reads the attach parameters once it registered.
+		// A scenario that does not care gets "registered" and "this modem has
+		// no such read" (71, InvalidQmiCommand).
+		if (handler == null && entry.name == 'INDICATION_REGISTER')
+			handler = {};
+		if (handler == null && entry.name == 'GET_LTE_ATTACH_PARAMS')
+			handler = { __error: 71 };
+
+		// built-in cell-lock defaults: a QMI modem without an AT channel asks
+		// its NAS client for the lock state on every validate (cell_lock.uc,
+		// dialect qmi). A scenario that does not care gets the answer most
+		// modems give, "no such read" (71) — no dialect, nothing written.
+		if (handler == null && entry.name in [ 'GET_CELL_CONFIG', 'GET_CELL_LOCK_CONFIG', 'GET_NR5G_CELL_CONFIG' ])
+			handler = { __error: 71 };
+
 		if (handler == null)
 			die(sprintf('mockhub: no handler for %s', entry.name));
 

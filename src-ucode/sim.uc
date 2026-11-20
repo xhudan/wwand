@@ -21,6 +21,7 @@ import * as hexmod from 'wwand.codec.hex';
 import * as backend from 'wwand.backend';
 import * as uimmod from 'wwand.codec.schema.uim';
 import * as sim_plmn from 'wwand.sim_plmn';
+import * as siminventory from 'wwand.siminventory';
 
 const QMI_ERR_NO_EFFECT = 26;
 
@@ -93,7 +94,7 @@ export function pin_block_reason(retries, force)
 
 // A CARD POLL MUST NOT OUTLIVE ITS SESSION. The retries below re-enter
 // unlock_uim/unlock_dms, which re-read modem.uim / modem.dms at entry — and
-// teardown nulls those (modem.uc:1713). An anonymous timer firing after an
+// teardown nulls those (modem.uc:2081). An anonymous timer firing after an
 // unplug or a config reload inside the up-to-10 s poll window therefore
 // dereferenced null, and a throw inside a uloop callback ends the program: the
 // next timer never runs and uloop.run() does not return (measured 2026-09-19).
@@ -132,7 +133,7 @@ function watch_card_ready(modem, uim, on_ready)
 {
 	// THE WAITER LIVES ON THE CLIENT, and carries an owner token. A single
 	// modem-wide slot let two unlocks steal from each other: init calls
-	// sim.unlock (modem_init_qmi.uc:593) while the eSIM path schedules its own
+	// sim.unlock (modem_init_qmi.uc:753) while the eSIM path schedules its own
 	// (esim_bridge.uc:651), and nothing serialises them — the second overwrote
 	// the first, and whichever finished first cleared the OTHER's waiter.
 	let mine = {};
@@ -574,18 +575,112 @@ export function unblock_puk(modem, puk, new_pin, cb)
 	attempt();
 };
 
+// the attempts a bring-up read (modem_mbim.uc self.pin1), for the retry
+// guard only, when nothing can be asked live. Not its state — a snapshot that
+// old must not decide "already" or "disabled".
+function pin1_snapshot(modem)
+{
+	if (modem.pin1?.retries != null)
+		return { state: null, retries: modem.pin1.retries };
+
+	return null;
+}
+
+// PIN1 as the card reports it, for the two PIN operations below: cb({ state,
+// retries }) with state 1/2 = enabled (not verified / verified), 3 = disabled,
+// 4/5 = blocked / permanently blocked (QmiUimPinState, libqmi 1.38 — the DMS
+// QmiDmsUimPinStatus numbers the same states the same way). cb(null) when no
+// transport can say, which the callers treat as "unknown", never as a state;
+// cb(null, err) when the channel went away while asking.
+// UIM is authoritative where present; a card whose UPIN replaces PIN1 counts
+// the UPIN's attempts (unlock_uim reads them the same way).
+function pin1_status(modem, cb)
+{
+	if (modem.uim)
+		return modem.uim.request('GET_CARD_STATUS', {}, (err, data) => {
+			let found = err ? null : find_app(data.card_status);
+			let app = found?.app;
+
+			if (!app)
+				return cb(null);
+
+			cb({ state: app.pin1_state,
+			     retries: app.upin_replaces_pin1 ? found.card.upin_retries : app.pin1_retries });
+		}, { no_recovery: true });
+
+	if (modem.dms)
+		return modem.dms.request('GET_PIN_STATUS', {}, (err, data) =>
+			cb(err || data?.pin1 == null ? null
+			   : { state: data.pin1.status, retries: data.pin1.verify_retries }),
+			{ no_recovery: true });
+
+	// native MBIM without the passthrough: asked live (modem_mbim.uc
+	// mbim_pin.status, PIN List + PIN query). `err` = the channel went away
+	// meanwhile: the operation stops there, nothing is sent on a closing client
+	if (type(modem.mbim_pin?.status) == 'function')
+		return modem.mbim_pin.status((st, err) => cb(err ? null : (st ?? pin1_snapshot(modem)), err));
+
+	cb(pin1_snapshot(modem));
+}
+
+
+// A PIN typed by hand into an operation that verifies it costs an attempt when
+// it is wrong, like the automatic entry does. The same floor applies, so a typo
+// on a card with one attempt left cannot turn it into a PUK lock — unless the
+// caller says it means it (`force`), the manual release's rule (pin_block_reason).
+function pin_retry_guard(st, force)
+{
+	if (st?.state == 4 || st?.state == 5)
+		return { error: 'pin_blocked', status: st.state };
+
+	if (!force && st?.retries != null && st.retries < PIN_MIN_RETRIES)
+		return { error: 'low_retries', retries: st.retries };
+
+	return null;
+}
+
+// After a PIN operation failed in a way that may have reached the card: bring
+// the attempts the retry guard falls back to (modem.pin1, pin1_status) down to
+// what the card said, or one lower when it said nothing. A snapshot left as it
+// was would let the guard see two attempts on a card that has one. Erring low
+// only ever asks for `force` one time too many.
+function note_failed_attempt(modem, retries)
+{
+	if (modem.pin1 == null)
+		return;
+
+	if (retries != null)
+		modem.pin1.retries = retries;
+	else if (modem.pin1.retries != null && modem.pin1.retries > 0)
+		modem.pin1.retries--;
+}
+
+// the transports that can run a PIN operation, in the order they are tried.
+// Native MBIM sits after QMI and before AT: on an MBIM modem with the
+// passthrough the QMI path is there and goes first, without it this is the one
+// transport that needs no AT port (duck-typed modem.mbim_pin, like the PUK).
+function pin_chain(modem)
+{
+	let chain = [];
+
+	if (modem.uim)      push(chain, 'uim');
+	if (modem.dms)      push(chain, 'dms');
+	if (modem.mbim_pin) push(chain, 'mbim');
+	if (modem.at)       push(chain, 'at');
+
+	return chain;
+}
+
 // enable (lock) or disable (unlock) the SIM PIN1 query — whether the card asks
 // for the PIN at power-on. Needs the current PIN. Tries QMI first (UIM, then
-// DMS), falls back to AT+CLCK on a transport rejection. cb(err, { enabled }).
-export function set_pin_lock(modem, enable, pin, cb)
+// DMS), then native MBIM, then AT+CLCK, moving on only after a transport
+// rejection. cb(err, { enabled, retries? }).
+export function set_pin_lock(modem, enable, pin, cb, opts)
 {
 	let enabled = enable ? 1 : 0;
 	let pin_id = uimmod.PIN_ID_PIN1;
 
-	let chain = [];
-	if (modem.uim) push(chain, 'uim');
-	if (modem.dms) push(chain, 'dms');
-	if (modem.at)  push(chain, 'at');
+	let chain = pin_chain(modem);
 
 	let i = 0, attempt;
 
@@ -596,8 +691,10 @@ export function set_pin_lock(modem, enable, pin, cb)
 		let be = chain[i++];
 
 		let handle = (err, data) => {
-			if (err && err.code == QMI_ERR_NO_EFFECT)     // already in the requested state
-				return cb(null, { enabled: !!enable, note: 'no_effect' });
+			// already in the requested state — and the card verified nothing,
+			// which is what `already` tells a caller that would store the PIN
+			if (err && err.code == QMI_ERR_NO_EFFECT)
+				return cb(null, { enabled: !!enable, note: 'no_effect', already: true });
 
 			if (!err)
 				return cb(null, { enabled: !!enable });
@@ -621,6 +718,9 @@ export function set_pin_lock(modem, enable, pin, cb)
 			if (transport_reject && i < length(chain))
 				return attempt();
 
+			if (!transport_reject)
+				note_failed_attempt(modem, data?.retries?.verify);
+
 			cb({ error: err.error ?? 'qmi', detail: err, retries: data?.retries?.verify });
 		};
 
@@ -635,6 +735,10 @@ export function set_pin_lock(modem, enable, pin, cb)
 				info: { pin_id: pin_id, enabled: enabled, pin: pin },
 			}, handle, { no_recovery: true });
 
+		if (be == 'mbim')
+			return modem.mbim_pin.lock(!!enable, pin, (err, d) =>
+				handle(err ? { error: 'mbim', detail: err } : null, d));
+
 		// AT+CLCK="SC",<1 lock|0 unlock>,"<pin>"
 		modem.at.send(sprintf('AT+CLCK="SC",%d,"%s"', enabled, pin),
 			(err) => handle(err ? { error: 'at', detail: err } : null));
@@ -642,30 +746,103 @@ export function set_pin_lock(modem, enable, pin, cb)
 
 	// idempotent: read the current PIN1 state and short-circuit if already in
 	// the requested state — avoids a spurious AccessDenied and never touches a
-	// retry. PIN1 state 1/2 = enabled, 3 = disabled, 4/5 = blocked. Use UIM
-	// (authoritative where present, and what the EG06 uses), else DMS.
-	let after_state = (st) => {
-		if (st != null) {
-			if (st == 4 || st == 5)
-				return cb({ error: 'pin_blocked', status: st });
+	// retry. Use UIM (authoritative where present, and what the EG06 uses),
+	// else DMS.
+	// "already" before the retry guard: a request that sends nothing costs
+	// nothing, and refusing it for low retries would report a failure that is
+	// not one. A BLOCKED PIN first, though — it is neither on nor off, and
+	// "not enabled" would read it as already disabled.
+	pin1_status(modem, (st, serr) => {
+		if (serr)
+			return cb(serr);
 
-			if (!!enable == (st == 1 || st == 2))
-				return cb(null, { enabled: !!enable, already: true });
-		}
+		if (st?.state == 4 || st?.state == 5)
+			return cb({ error: 'pin_blocked', status: st.state });
+
+		if (st?.state != null && !!enable == (st.state == 1 || st.state == 2))
+			return cb(null, { enabled: !!enable, already: true });
+
+		let g = pin_retry_guard(st, opts?.force);
+
+		if (g)
+			return cb(g);
 
 		attempt();
+	});
+};
+
+// change PIN1 from `old_pin` to `new_pin` (QMI UIM Change PIN 0x0028, DMS UIM
+// Change PIN 0x002A, libqmi 1.38; MBIM PIN set with PinOperation CHANGE,
+// libmbim 1.32 mbim-enums.h; AT+CPWD="SC", 3GPP TS 27.007 7.5). The chain and
+// its one rule are set_pin_lock's: move on only after a QMI reject that never
+// reached the card, so a wrong old PIN costs one attempt, not one per transport.
+//
+// A card whose PIN query is OFF is refused before anything is sent: the card
+// itself refuses CHANGE CHV on a disabled CHV1 ("in contradiction with CHV
+// status", GSM 11.11 9.2.10), and what a firmware makes of that is its own —
+// the one thing it must never become is an attempt counted against a PIN the
+// user believes is not even in use.
+// cb(err, { changed: true, via, retries? }).
+export function change_pin(modem, old_pin, new_pin, cb, opts)
+{
+	let chain = pin_chain(modem);
+
+	if (!length(chain))
+		return cb({ error: 'no_pin_backend' });
+
+	let i = 0, attempt;
+
+	attempt = () => {
+		let be = chain[i++];
+
+		let handle = (err, data) => {
+			if (!err)
+				return cb(null, { changed: true, via: be });
+
+			let transport_reject = (err.error == 'qmi') && PINLOCK_FALLBACK[sprintf('%d', err.code)];
+
+			if (transport_reject && i < length(chain))
+				return attempt();
+
+			if (!transport_reject)
+				note_failed_attempt(modem, data?.retries?.verify);
+
+			cb({ error: err.error ?? 'change_failed', detail: err, retries: data?.retries?.verify });
+		};
+
+		if (be == 'uim')
+			return modem.uim.request('CHANGE_PIN', {
+				session: { session_type: uimmod.SESSION_TYPE_PRIMARY_GW_PROVISIONING, aid: '' },
+				info: { pin_id: uimmod.PIN_ID_PIN1, old_pin: old_pin, new_pin: new_pin },
+			}, handle, { no_recovery: true });
+
+		if (be == 'dms')
+			return modem.dms.request('CHANGE_PIN', {
+				info: { pin_id: uimmod.PIN_ID_PIN1, old_pin: old_pin, new_pin: new_pin },
+			}, handle, { no_recovery: true });
+
+		if (be == 'mbim')
+			return modem.mbim_pin.change(old_pin, new_pin, (err, d) =>
+				handle(err ? { error: 'mbim', detail: err } : null, d));
+
+		modem.at.send(sprintf('AT+CPWD="SC","%s","%s"', old_pin, new_pin),
+			(err) => handle(err ? { error: 'at', detail: err } : null));
 	};
 
-	if (modem.uim)
-		return modem.uim.request('GET_CARD_STATUS', {}, (err, data) =>
-			after_state(err ? null : find_app(data.card_status)?.app?.pin1_state),
-			{ no_recovery: true });
+	pin1_status(modem, (st, serr) => {
+		if (serr)
+			return cb(serr);
 
-	if (modem.dms)
-		return modem.dms.request('GET_PIN_STATUS', {}, (err, data) =>
-			after_state(err ? null : data?.pin1?.status), { no_recovery: true });
+		let g = pin_retry_guard(st, opts?.force);
 
-	attempt();
+		if (g)
+			return cb(g);
+
+		if (st?.state == 3)
+			return cb({ error: 'pin_disabled' });
+
+		attempt();
+	});
 };
 
 // --- card identity (IMSI / ICCID) -------------------------------------------
@@ -740,6 +917,27 @@ export function enumerated(slots)
 			return false;
 
 	return true;
+};
+
+// The slot a bring-up asserts, { slot, why }: the one holding the card an
+// ICCID-bound interface needs (`self.bound_iccid`, daemon.uc), else
+// `option sim_slot`; slot 0 = leave as is. The bound card wins because the
+// interface switches to it on its ifup anyway: asserting sim_slot first would
+// change the card twice on every boot. `slots` null asks only whether there
+// is anything to assert (no slot list read yet).
+export function boot_slot(self, slots)
+{
+	let b = self.bound_iccid?.();
+	let cfg = +(self.config?.sim_slot ?? 0);
+
+	if (slots == null)
+		return { slot: (b ? -1 : cfg), why: null };
+
+	for (let s in (b ? slots : []))
+		if (!s.inferred && +s.physical > 0 && siminventory.norm_iccid(s.iccid) == b.iccid)
+			return { slot: +s.physical, why: sprintf('it holds card %s, which interface %s is bound to', b.iccid, b.interface) };
+
+	return { slot: cfg, why: cfg ? 'option sim_slot' : null };
 };
 
 export function slot_status(modem, cb)
@@ -1509,6 +1707,105 @@ function uim_slot(modem, slot)
 // errors at every start (evidence: ddimension/wwand#51, RM520N, 2026-10-14).
 const NOT_A_FAULT = { no_recovery: true };
 
+// --- QMI SEND_APDU alone (channels by hand) transport ---
+//
+// A firmware can carry UIM SEND_APDU and neither of the logical channel
+// messages, and no CCHO/CGLA/CSIM on its AT port either. HW-measured on a
+// Huawei E392 (11.433.59.00.192), 2026-11-19: LOGICAL_CHANNEL (0x3F) answers
+// InvalidArgument for any AID, OPEN_LOGICAL_CHANNEL (0x42) InvalidQmiCommand,
+// while SEND_APDU without a channel id passes the APDU to the card as it is —
+// MANAGE CHANNEL opens a channel, and a SELECT with that channel in its CLA
+// reaches it. So the channel is opened, selected and closed with the card's
+// own commands (ISO 7816-4 MANAGE CHANNEL / SELECT by DF name), and the
+// channel travels in the CLA byte, not in the QMI channel TLV.
+function qmi_raw_apdu(modem, slot, apdu_hex, cb, opts)
+{
+	modem.uim.request('SEND_APDU', {
+		slot: uim_slot(modem, slot), apdu: hex_to_arr(apdu_hex),
+	}, (err, data) => {
+		if (err)
+			return cb(err, null);
+
+		cb(null, lc(arr_to_hex(data?.response ?? [])));
+	}, { timeout: 30000, ...(opts ?? {}) });
+}
+
+// ISO 7816-4 5.4.1: channels 0-3 in the low bits of a first interindustry
+// CLA, 4-19 in a further interindustry one (0x40 | channel - 4)
+function channel_cla(channel)
+{
+	return channel < 4 ? channel : (0x40 | (channel - 4));
+}
+
+// The caller's APDU for a channel it got from qmi_apdu_open. Most callers
+// put the channel into the CLA themselves; one that left a first
+// interindustry (or proprietary 8x) CLA at channel 0 gets it set here.
+function qmi_apdu_on_channel(channel, apdu_hex)
+{
+	let c = hex(substr(apdu_hex, 0, 2));
+
+	if (channel >= 1 && channel <= 3 && !(c & 0x40) && !(c & 0x03))
+		return sprintf('%02x%s', c | channel, substr(apdu_hex, 2));
+
+	return apdu_hex;
+}
+
+function qmi_apdu_close(modem, slot, channel, cb)
+{
+	qmi_raw_apdu(modem, slot, sprintf('007080%02x00', channel), (err) => cb(err ?? null));
+}
+
+function qmi_apdu_open(modem, slot, aid_hex, cb)
+{
+	if (!modem.uim)
+		return cb({ error: 'no_uim_client' }, null);
+
+	// MANAGE CHANNEL, open: the card assigns the number
+	qmi_raw_apdu(modem, slot, '0070000001', (err, r) => {
+		if (err)
+			return cb(err, null);
+
+		if (length(r) != 6 || substr(r, 2) != '9000')
+			return cb({ error: 'uicc_select', detail: sprintf('MANAGE CHANNEL: %s', r) }, null);
+
+		let ch = hex(substr(r, 0, 2));
+
+		if (!(ch >= 1 && ch <= 19))
+			return cb({ error: 'no_channel' }, null);
+
+		let fail = (e) => qmi_apdu_close(modem, slot, ch, () => cb(e, null));
+		let aid = lc(aid_hex);
+
+		// SELECT by DF name. A 3GPP application (RID A000000087) is asked for
+		// its FCP as TS 102 221 has it; anything else (the ISD-R) gets the
+		// GlobalPlatform form, whose answer is the FCI the eUICC code reads.
+		let p2 = (substr(aid, 0, 10) == 'a000000087') ? 0x04 : 0x00;
+		let select = sprintf('%02xa404%02x%02x%s', channel_cla(ch), p2, length(aid) / 2, aid);
+
+		qmi_raw_apdu(modem, slot, select, (err, r) => {
+			if (err)
+				return fail(err);
+
+			let sw = substr(r, -4);
+			let ok = (data) => cb(null, { channel: ch, select_response: data });
+
+			if (sw == '9000')
+				return ok(substr(r, 0, length(r) - 4));
+
+			// T=0: the answer waits to be fetched
+			if (substr(sw, 0, 2) == '61')
+				return qmi_raw_apdu(modem, slot, sprintf('%02xc00000%s', channel_cla(ch), substr(sw, 2)), (err, g) => {
+					if (err || substr(g ?? '', -4) != '9000')
+						return ok('');
+
+					ok(substr(g, 0, length(g) - 4));
+				});
+
+			fail({ error: 'uicc_select', detail: sprintf('SELECT %s: %s', aid, sw) });
+		});
+	});
+}
+
 function apdu_backend(modem, slot, cb)
 {
 	backend.choose(modem, '_apdu_be', [
@@ -1553,6 +1850,20 @@ function apdu_backend(modem, slot, cb)
 			go();
 		} },
 		{ name: 'at', probe: (ok) => ok(!!modem.at) },
+		// no AT port: SEND_APDU alone, when the card answers a MANAGE CHANNEL
+		// through it. A modem with an AT port that cannot open a channel
+		// gets here from apdu_open, on its first real open.
+		{ name: 'qmi_apdu', probe: (ok) => {
+			if (!modem.uim)
+				return ok(false);
+
+			qmi_raw_apdu(modem, slot, '0070000001', (err, r) => {
+				if (err || length(r) != 6 || substr(r, 2) != '9000')
+					return ok(false);
+
+				qmi_apdu_close(modem, slot, hex(substr(r, 0, 2)), () => ok(true));
+			}, NOT_A_FAULT);
+		} },
 	], cb);
 }
 
@@ -1653,9 +1964,72 @@ function apdu_transport_gone(modem, be)
 {
 	let there = (be == 'mbim') ? modem.mbim_uicc
 		: (be == 'at') ? modem.at
-		: (be == 'qmi') ? modem.uim : true;
+		: (be == 'qmi' || be == 'qmi_apdu') ? modem.uim : true;
 
 	return there ? null : { error: 'no_apdu_channel', detail: sprintf('%s transport not available (modem re-initialising?)', be) };
+}
+
+// DECLARING AN IPAd. An SGP.32 card that also carries an IPAe picks the IPA it
+// serves from the TERMINAL CAPABILITY the device sends (ETSI TS 102 221, INS
+// AA): none, or one without tag 84, runs the card's own IPAe, and ES10 from
+// the device then gets 6985; tag 84 saying "IPAd supported" switches the IPAe
+// off and serves ES10 (IDEMIA DAKOTA IoT v1.2 Device Requirements, DEV_REQ_8
+// and §3, 2025-10-17). The modem does not send tag 84 by itself: an IDEMIA card
+// behind the RG502Q on 5.202 answered 6985 until `A9 03 84 01 01` went out on
+// the basic channel, then GetEID and GetEUICCInfo1 answered (HW-seen,
+// 2026-11-11). The declaration holds for one card session, so it goes out
+// before every ISD-R open rather than once — a card reset in between would
+// otherwise bring the IPAe back. Only on `option ipa_mode 'ipad'`: sent
+// unasked it would switch off the IPAe of every such card, and a fleet may
+// run on it.
+// Best-effort: a refusal is logged, and the open goes ahead either way.
+const TERMINAL_CAPABILITY_IPAD = '80AA000005A903840101';
+
+function declare_ipad(modem, slot, be, cb)
+{
+	if (modem.config?.ipa_mode != 'ipad' || index([ 'at', 'mbim', 'qmi' ], be) < 0)
+		return cb();
+
+	let done = (err, resp) => {
+		let sw = (!err && length(resp ?? '') >= 4) ? uc(substr(resp, -4)) : null;
+
+		// stderr, in the modem log's own format: procd hands it to syslog
+		// (files/wwand.init), and no logger reaches this far down
+		if (sw != '9000')
+			warn(sprintf('warn: modem %s: TERMINAL CAPABILITY (IPAd) not accepted: %s\n',
+				modem.id ?? '?', sw ?? sprintf('%J', err)));
+		cb();
+	};
+	let via_at = () => modem.at.send(sprintf('AT+CSIM=%d,"%s"', length(TERMINAL_CAPABILITY_IPAD), TERMINAL_CAPABILITY_IPAD), (err, res) => {
+		for (let l in (res?.lines ?? [])) {
+			let m = match(l, /\+CSIM: *[0-9]+,"?([0-9A-Fa-f]+)"?/);
+
+			if (m)
+				return done(null, m[1]);
+		}
+
+		done(err ?? { error: 'no_response' }, null);
+	}, { timeout: 15000 });
+
+	// THE MODEM CAN REFUSE WHAT THE CARD WOULD TAKE. An EG25-G answers a QMI
+	// SEND_APDU without a channel id with ACCESS_DENIED (QMI error 82), while
+	// the same APDU over AT+CSIM gets 9000 from the card and ES10 is served
+	// after it (KeepGo eUICC, EG25GGBR07A08M2G, HW-seen 2026-11-11). So a
+	// transport error — not a card status word — goes on to AT when the modem
+	// has a port. A status word is the card's answer and is final.
+	let or_at = (err, resp) => (err && modem.at) ? via_at() : done(err, resp);
+
+	// the basic channel: AT+CSIM, QMI SEND_APDU without a channel id, and
+	// channel 0 for MBIM UICC (not HW-tested there)
+	if (be == 'at')
+		return via_at();
+
+	if (be == 'mbim')
+		return modem.mbim_uicc.apdu(0, TERMINAL_CAPABILITY_IPAD, or_at);
+
+	modem.uim.request('SEND_APDU', {
+		slot: uim_slot(modem, slot), apdu: hex_to_arr(TERMINAL_CAPABILITY_IPAD),
+	}, (err, data) => or_at(err, err ? null : arr_to_hex(data.response ?? [])), { timeout: 15000 });
 }
 
 // open a logical channel to `aid_hex` on physical slot `slot` (1-based);
@@ -1672,13 +2046,39 @@ export function apdu_open(modem, slot, aid_hex, cb, opts)
 		if (gone)
 			return cb(gone, null);
 
+		if (lc(aid_hex ?? '') == ISDR_AID && !opts?._declared)
+			return declare_ipad(modem, slot, be, () =>
+				apdu_open(modem, slot, aid_hex, cb, { ...(opts ?? {}), _declared: true }));
+
 		if (be == 'mbim')
 			return modem.mbim_uicc.open(aid_hex, (err, d) =>
 				cb(err, d ? { channel: d.channel, select_response: d.select_response } : null),
 				opts?.probe ? NOT_A_FAULT : null);
 
+		// THE AT PORT MAY NOT KNOW CCHO. `at` is chosen for having a port, not
+		// for having opened a channel (the discovery open fails the same way
+		// on every plain SIM). So a real open the modem refuses, on a port
+		// that never opened one, is tried over SEND_APDU alone, and that
+		// transport stays when it works (Huawei E392, see qmi_apdu_open).
 		if (be == 'at')
-			return at_apdu_open(modem, aid_hex, cb, opts);
+			return at_apdu_open(modem, aid_hex, (err, ch) => {
+				if (!err)
+					modem._at_ccho_ok = true;
+
+				if (!err || opts?.probe || modem._at_ccho_ok || !modem.uim || !refused_answer(err))
+					return cb(err, ch);
+
+				qmi_apdu_open(modem, slot, aid_hex, (e2, ch2) => {
+					if (e2)
+						return cb(err, null);
+
+					modem._apdu_be = 'qmi_apdu';
+					cb(null, ch2);
+				});
+			}, opts);
+
+		if (be == 'qmi_apdu')
+			return qmi_apdu_open(modem, slot, aid_hex, cb);
 
 		if (be != 'qmi')
 			return cb({ error: 'no_apdu_channel' }, null);
@@ -1794,6 +2194,9 @@ export function apdu_send(modem, slot, channel, apdu_hex, cb)
 	if (!modem.uim)
 		return cb({ error: 'no_uim_client' }, null);
 
+	if (modem._apdu_be == 'qmi_apdu')
+		return qmi_raw_apdu(modem, slot, qmi_apdu_on_channel(+channel, apdu_hex), cb);
+
 	modem.uim.request('SEND_APDU', {
 		slot: uim_slot(modem, slot), channel_id: channel, apdu: hex_to_arr(apdu_hex),
 	}, (err, data) => {
@@ -1873,6 +2276,9 @@ export function apdu_close(modem, slot, channel, cb)
 	if (!modem.uim)
 		return cb({ error: 'no_uim_client' });
 
+	if (modem._apdu_be == 'qmi_apdu')
+		return qmi_apdu_close(modem, slot, +channel, cb);
+
 	modem.uim.request('LOGICAL_CHANNEL', {
 		slot: uim_slot(modem, slot), channel_id: channel, terminate: 1,
 	}, (err) => cb(err ?? null));
@@ -1888,13 +2294,14 @@ export function apdu_close(modem, slot, channel, cb)
 // info: { sgp32: bool, ipae_supported: bool, svn: '2.5.0' | null,
 //         ipa: 'ipae' | 'ipad' | null } — ipa only for an SGP.32 card.
 //
-// The FCI only says the card SUPPORTS an IPAe. Which IPA is active is decided
-// when the card starts, and a card running its IPAe refuses ES10 from the
-// device altogether, since ES10 is then internal to it: SGP.32 has the
-// device's IPA (IPAd) ask by sending ES10 at all. So GetEUICCInfo1 — which an
-// eUICC that serves a device IPA always answers — tells the two apart:
-// 6985 (conditions of use not satisfied) is IPAe, an answer is IPAd. HW-seen
-// on the card above: every ES10 command, GetEUICCInfo1 included, 6985.
+// The FCI only says the card SUPPORTS an IPAe. Which IPA is active follows the
+// device's TERMINAL CAPABILITY (declare_ipad, above apdu_open), and a card
+// running its IPAe refuses ES10 from the device altogether, since ES10 is then
+// internal to it. So GetEUICCInfo1 — which an eUICC that serves a device IPA
+// always answers — tells the two apart: 6985 (conditions of use not
+// satisfied) is IPAe, an answer is IPAd. HW-seen on the card above: every ES10
+// command, GetEUICCInfo1 included, 6985. With `option ipa_mode 'ipad'` the open
+// below declares the IPAd first, so the read reports what that achieved.
 export function card_euicc_info(modem, cb)
 {
 	let slot = +(modem.active_slot ?? modem.config?.sim_slot ?? 1) || 1;

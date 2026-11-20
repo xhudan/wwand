@@ -484,6 +484,35 @@ function s_signal_saturated(next) {
 	}));
 }
 
+// AN RSSI-ONLY READING BELONGS TO THE GENERATION THE MODEM IS ON. The ME906s
+// (no MBIMEx) answers the v1 Signal State, RSSI alone; on GPRS/EDGE it was
+// filed under LTE and shown as "LTE rssi -89 dBm" (2026-11-18). The class
+// mask from the registration decides; unknown or LTE keeps the old filing.
+function s_signal_generation(next) {
+	let sig_schema = { service: bc.service,
+		commands: { SIGNAL_STATE_V2: bc.commands.SIGNAL_STATE_V2 } };
+	let raw = build_signal(12, []);   // index 12 -> -89 dBm, no RsrpSnr tail
+	let cases = [
+		[ ext.DATA_CLASS_GPRS | ext.DATA_CLASS_EDGE, (s) => s.gsm_rssi == -89 && !s.lte, 'EDGE -> gsm_rssi' ],
+		[ ext.DATA_CLASS_UMTS | ext.DATA_CLASS_HSDPA, (s) => s.wcdma?.rssi == -89 && !s.lte, 'HSPA -> wcdma.rssi' ],
+		[ ext.DATA_CLASS_LTE, (s) => s.lte?.rssi == -89 && s.gsm_rssi == null, 'LTE -> lte.rssi' ],
+		[ null, (s) => s.lte?.rssi == -89, 'unknown class keeps lte.rssi' ],
+	];
+	let step;
+	step = (i) => {
+		if (i >= length(cases))
+			return next();
+
+		let mc = make_mc(sig_schema, { SIGNAL_STATE_V2: { __raw: raw } });
+
+		mc.open(() => backend.get_signal(mc, (sig) => {
+			ok(sig != null && cases[i][1](sig), sprintf('signal generation: %s', cases[i][2]));
+			step(i + 1);
+		}, cases[i][0]));
+	};
+	step(0);
+}
+
 // ...whereas these are not readings at all
 function s_signal_unusable(next) {
 	let sig_schema = { service: bc.service,
@@ -753,7 +782,8 @@ function s_data_mode(next) {
 					eq(dm4, null, 'data_mode: CUSTOM alone says nothing, so it answers nothing');
 
 					// a mask with no known RAT bit at all reads the same way
-					let mc5 = make_mc(bc, { REGISTER_STATE: reg_state(1 << 2) });
+					// (1xRTT: CDMA, which wwand has no RAT name for)
+					let mc5 = make_mc(bc, { REGISTER_STATE: reg_state(ext.DATA_CLASS_1XRTT) });
 					mc5.open(() => backend.get_data_mode(mc5, (dm5) => {
 						eq(dm5, null, 'data_mode: ...and so does any mask carrying no RAT we know');
 
@@ -763,7 +793,29 @@ function s_data_mode(next) {
 							REGISTER_STATE: reg_state(ext.DATA_CLASS_CUSTOM | ext.DATA_CLASS_5G_SA) });
 						mc6.open(() => backend.get_data_mode(mc6, (dm6) => {
 							eq(dm6?.mode, 'SA', 'data_mode: CUSTOM alongside a known class does not hide it');
-							next();
+
+							// BELOW LTE IS A MODE TOO. An ME906s that fell back to
+							// GPRS/EDGE (0x03) answered nothing, the caller kept
+							// the last mode, and status said LTE on an EDGE link.
+							let legacy = [
+								[ ext.DATA_CLASS_GPRS | ext.DATA_CLASS_EDGE, 'EDGE' ],
+								[ ext.DATA_CLASS_GPRS, 'GSM' ],
+								[ ext.DATA_CLASS_UMTS, 'UMTS' ],
+								[ ext.DATA_CLASS_UMTS | ext.DATA_CLASS_HSDPA | ext.DATA_CLASS_HSUPA, 'HSPA' ],
+							];
+							let step;
+							step = (i) => {
+								if (i >= length(legacy))
+									return next();
+
+								let mcl = make_mc(bc, { REGISTER_STATE: reg_state(legacy[i][0]) });
+								mcl.open(() => backend.get_data_mode(mcl, (dml) => {
+									eq(dml?.mode, legacy[i][1], sprintf('data_mode: mask 0x%x -> %s', legacy[i][0], legacy[i][1]));
+									eq(dml?.lte, false, sprintf('data_mode: %s is not LTE', legacy[i][1]));
+									step(i + 1);
+								}));
+							};
+							step(0);
 						}));
 					}));
 				}));
@@ -889,7 +941,7 @@ function s_at_over_mbim_compal(next) {
 
 // --- runner ------------------------------------------------------------------
 
-let scenarios = [ s_signal, s_signal_saturated, s_signal_unusable, s_signal_placeholder, s_signal_placeholder_snr, s_cells, s_cells_unknown,
+let scenarios = [ s_signal, s_signal_saturated, s_signal_generation, s_signal_unusable, s_signal_placeholder, s_signal_placeholder_snr, s_cells, s_cells_unknown,
 		  s_cells_out_of_range, s_cells_signed_physical, s_cells_signed_sinr_in_index_range, s_cells_unknown_rsrp_keeps_the_rest, s_cells_coded_still_coded, s_cells_v1, s_fragments, s_data_mode, s_reg_detail, s_slots,
 	s_at_over_mbim, s_at_over_mbim_compal ];
 let i = 0;
@@ -1004,6 +1056,18 @@ backend.uicc_reset(resetc, (err) => {
 	eq(resetc.last.info, p32(0), 'uicc-reset: [passthrough=disable]');
 });
 
+// --- IP_CONFIGURATION query is the FULL info buffer, not session_id alone ----
+// The MediaTek T7xx (FM350) rejects a 4-byte query with InvalidParameters (21);
+// libmbim sends the whole 15-u32 MBIM_IP_CONFIGURATION_INFO structure, zero
+// except the session id (mbimcli-basic-connect.c:912, libmbim 1.32.0).
+(function () {
+	let info = mbim.encode_info(bc.commands.IP_CONFIGURATION.query, { session_id: 7 });
+	eq(length(info), 60, 'ip-config query: 15 u32 fields (60 bytes), not 4');
+	eq(info, p32(7) + p32(0) + p32(0) + p32(0) + p32(0) + p32(0) + p32(0) +
+		p32(0) + p32(0) + p32(0) + p32(0) + p32(0) + p32(0) + p32(0) + p32(0),
+		'ip-config query: session id then 14 zero fields');
+})();
+
 // --- native MBIM SMS Read parsing (layout confirmed on the EG06) ------------
 // Response: Format(u32) MessagesCount(u32), then N [offset,size] ref pairs, each
 // to a record { index, status, pduOffset, pduSize }; PDU bytes at pduOffset.
@@ -1030,6 +1094,26 @@ backend.uicc_reset(resetc, (err) => {
 		eq(recs[0].status, 1, 'sms-read: message status');
 		eq(recs[0].pdu, PDU, 'sms-read: extracted PDU hex');
 	});
+
+	// the standard layout (libmbim, mbim-message.c:710): the PDU offset counts
+	// from the RECORD. Record at 16, PDU at record+16 = 32. Read from the
+	// buffer start, offset 16 would be the record header itself.
+	let std = p32(0) + p32(1) + p32(16) + p32(16) +
+		p32(6) + p32(0) + p32(16) + p32(length(pdu_bytes)) + pdu_bytes;
+
+	eq(backend.sms_records(std)[0]?.pdu, PDU, 'sms-read: the record-relative offset of the standard');
+
+	// two records the EG06 way (buffer-relative): records at 24 and 40, PDUs
+	// at 56 and 73. Read record-relative, the first would land on 80 — inside
+	// the buffer, but not where any PDU is; the second points past the end, so
+	// the response as a whole is buffer-relative.
+	let two = p32(0) + p32(2) + p32(24) + p32(16) + p32(40) + p32(16) +
+		p32(1) + p32(1) + p32(56) + p32(17) +
+		p32(2) + p32(1) + p32(73) + p32(17) + pdu_bytes + pdu_bytes;
+	let tr = backend.sms_records(two);
+
+	eq([ length(tr), tr[0]?.index, tr[0]?.pdu, tr[1]?.pdu ], [ 2, 1, PDU, PDU ],
+	   'sms-read: one reading for the whole response');
 
 	// delete by index -> CID 4, [flag=INDEX(1), index]
 	let delseen = null;
@@ -1270,6 +1354,48 @@ eq(fe_answers, 1, 'on_answer: an indication is not an answer to anything we aske
 	eq(hc.raw_send('', 9, (err) => { hcb = err; }), false, 'held: raw_send refuses');
 	eq([ hcb?.error, herrs, length(keys(hc.pending)) ], [ 'send', [], 0 ],
 		'held: a send error for the caller, no counted error, nothing pending');
+}
+
+// --- network modes <-> MBIM data class (option modes, natively) --------------
+{
+	let M = { gsm: 1 << 2, umts: 1 << 3, lte: 1 << 4, tds: 1 << 5, nr5g: 1 << 6 };
+	let NR = ext.DATA_CLASS_5G_NSA | ext.DATA_CLASS_5G_SA;
+
+	// standard bits: 5G is both, the way ModemManager sends it
+	eq(backend.data_class_from_modes(M.lte | M.nr5g), ext.DATA_CLASS_LTE | NR,
+		'modes: lte,nr5g -> LTE | 5G_NSA | 5G_SA');
+	eq(backend.data_class_from_modes(M.umts),
+		ext.DATA_CLASS_UMTS | ext.DATA_CLASS_HSDPA | ext.DATA_CLASS_HSUPA, 'modes: umts is the whole 3G family');
+	eq(backend.data_class_from_modes(M.tds), 0,
+		'modes: td-scdma alone names nothing MBIM can select (0 would read as "any")');
+
+	// the T99W175 (HW-read 2026-11-08): caps "umts, hsdpa, hsupa, lte,
+	// 5g-nsa, custom", custom name "5G UWB" — CUSTOM is its 5G SA
+	let x55 = ext.DATA_CLASS_UMTS | ext.DATA_CLASS_HSDPA | ext.DATA_CLASS_HSUPA |
+		ext.DATA_CLASS_LTE | ext.DATA_CLASS_5G_NSA | ext.DATA_CLASS_CUSTOM;
+
+	eq(backend.custom_class(x55, '5G UWB'), ext.DATA_CLASS_5G_SA,
+		'custom: "5G" on caps that list 5G_NSA already stands for 5G SA');
+	eq(backend.data_class_custom(ext.DATA_CLASS_LTE | NR, x55, '5G UWB'),
+		ext.DATA_CLASS_LTE | ext.DATA_CLASS_5G_NSA | ext.DATA_CLASS_CUSTOM,
+		'modes: the CUSTOM fallback on that modem is 5G_NSA | CUSTOM, in place of 5G_SA');
+	eq(backend.data_class_custom(ext.DATA_CLASS_LTE, x55, '5G UWB'), null,
+		'modes: ...and there is none for a mask without the bit CUSTOM stands for');
+	eq(backend.data_class_custom(ext.DATA_CLASS_LTE | NR, 0x3f | NR, ''), null,
+		'modes: ...nor on caps without CUSTOM');
+	eq(backend.modes_from_data_class(x55, x55, '5G UWB'), M.umts | M.lte | M.nr5g,
+		'modes: its default preferred classes read back as umts,lte,nr5g');
+	eq(backend.modes_from_data_class(ext.DATA_CLASS_LTE | ext.DATA_CLASS_CUSTOM, x55, '5G UWB'), M.lte | M.nr5g,
+		'modes: CUSTOM alone beside LTE still reads as nr5g on that modem');
+
+	// "5GSA/TDS" (RM502Q) without 5G_SA in its caps: CUSTOM is the SA bit;
+	// "5G" without 5G_NSA: CUSTOM is NSA (mm-modem-helpers-mbim.c:34-66, 1.24.0)
+	eq(backend.custom_class(ext.DATA_CLASS_LTE | ext.DATA_CLASS_5G_NSA | ext.DATA_CLASS_CUSTOM, '5GSA/TDS'),
+		ext.DATA_CLASS_5G_SA, 'custom: "5GSA" is 5G SA');
+	eq(backend.custom_class(ext.DATA_CLASS_LTE | ext.DATA_CLASS_CUSTOM, '5G/TDS'),
+		ext.DATA_CLASS_5G_NSA, 'custom: "5G" on caps without 5G_NSA is NSA');
+	eq(backend.custom_class(ext.DATA_CLASS_LTE, '5G'), 0,
+		'custom: a name without the CUSTOM bit stands for nothing');
 }
 
 done('test_mbim_backend');

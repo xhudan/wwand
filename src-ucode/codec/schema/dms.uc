@@ -93,6 +93,15 @@ export default {
 			resp: { retries: { t: 0x10, f: { verify: 'u8', unblock: 'u8' } } },
 		},
 
+		// change PIN1; DMS fallback for modems without UIM. libqmi 1.38 "UIM
+		// Change PIN" 0x002A: Info 0x01 { Pin ID u8, Old PIN string, New PIN
+		// string }; response 0x10 Pin Retries Status on failure.
+		CHANGE_PIN: {
+			id: 0x002A,
+			req:  { info: { t: 0x01, f: { pin_id: 'u8', old_pin: 'lstring', new_pin: 'lstring' } } },
+			resp: { retries: { t: 0x10, f: { verify: 'u8', unblock: 'u8' } } },
+		},
+
 		GET_PIN_STATUS: {
 			id: 0x002B,
 			req:  {},
@@ -165,6 +174,18 @@ export default {
 			req:  { magic_string: { t: 0x01, f: 'string' },
 			        magic_number: { t: 0x02, f: 'u8' } },
 			resp: {},
+		},
+
+		// Foxconn Get Firmware Version 0x555E (libqmi 1.38.0
+		// qmi-service-dms.json, since 1.26): input Version Type 0x01 u8
+		// (QmiDmsFoxconnFirmwareVersionType: 0 firmware-mcfg, 1
+		// firmware-mcfg-apps, 2 apps), output Version 0x01 string. The two
+		// strings the v2 FCC magic above is hashed from (qmi_backend
+		// fcc_foxconn).
+		FOXCONN_GET_FIRMWARE_VERSION: {
+			id: 0x555E,
+			req:  { version_type: { t: 0x01, f: 'u8' } },
+			resp: { version: { t: 0x01, f: 'string' } },
 		},
 
 		// The legacy DMS card getters — `qmicli --dms-uim-get-iccid` /

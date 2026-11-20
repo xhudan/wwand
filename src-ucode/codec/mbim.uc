@@ -64,6 +64,46 @@ function uuid_str(bytes)
 		substr(h, 16, 4), substr(h, 20, 12));
 }
 
+// MBIM_DEVICE_SERVICES_INFO (Basic Connect CID 16, MBIM 1.0 §10.5.35) -> the
+// list of service UUIDs the function offers, lowercase strings. Layout:
+// DeviceServicesCount u32, MaxDssSessions u32, then one (offset u32, size u32)
+// pair per service, offsets from the start of the buffer, each pointing at an
+// element that opens with the 16-byte DeviceServiceId.
+//
+// ALL OR NOTHING: a truncated table or one malformed element makes the whole
+// answer null (unknown), never a shorter list. The list decides what is NOT
+// sent (mbim_client refuse_unlisted), so a service dropped from it here would
+// be refused for the life of the session although the modem offers it;
+// unknown gates nothing.
+export function decode_device_services(info)
+{
+	info = info ?? '';
+
+	let len = length(info);
+
+	if (len < 8)
+		return null;
+
+	let n = struct.unpack('<I', substr(info, 0, 4))[0];
+
+	if (n > (len - 8) / 8)
+		return null;
+
+	let refs_end = 8 + n * 8;
+	let out = [];
+
+	for (let i = 0; i < n; i++) {
+		let ref = struct.unpack('<II', substr(info, 8 + i * 8, 8));
+
+		if (ref[1] < 16 || ref[0] < refs_end || ref[1] > len || ref[0] > len - ref[1])
+			return null;
+
+		push(out, uuid_str(substr(info, ref[0], 16)));
+	}
+
+	return out;
+};
+
 // MBIM strings are UTF-16LE; ucode strings are UTF-8 byte strings. Both
 // directions have to convert by hand, because ucode's chr() is BYTE-oriented:
 // chr(0x4E2D) yields 0xff, not a three-byte UTF-8 sequence. The first version
@@ -474,18 +514,41 @@ function decode_struct(fields, buf, pos)
 	return [ res, pos ];
 }
 
+// THE FIXED PART ENDS WHERE THE FIRST REFERENCED DATA BEGINS. A field the
+// MBIM extensions APPEND after the v1 layout (REGISTER_STATE's
+// preferred_data_classes, MBIMEx v2) exists only in a v2+ answer; a v1 answer
+// has its DataBuffer there instead. A length check cannot tell the two apart —
+// the strings make a v1 answer longer than the field's offset — so every field
+// at or past the lowest offset a reference has named reads as absent. Seen on
+// a Huawei ME906s (no MBIMEx, 2026-11-18): "preferred" data class 0x00360032,
+// which is UTF-16 "2", "6" — the start of the provider id "26202". A reference
+// pointing back into the fields already read is malformed, and is ignored here
+// rather than allowed to truncate the rest.
 export function decode_info(fields, buf)
 {
 	let res = {};
 	let pos = 0;
 	let len = length(buf ?? '');
+	let data_start = len;
+
+	let note_ref = (o, size) => {
+		if (size > 0 && o >= pos && o < data_start)
+			data_start = o;
+	};
 
 	for (let name, fmt in fields) {
+		if (pos >= data_start) {
+			// the same absent values a buffer that ends early gives
+			res[name] = (type(fmt) == 'object' || fmt == 'ipv4-array' || fmt == 'ipv6-array') ? [] : null;
+			continue;
+		}
+
 		if (fmt == 'string') {
 			if (pos + 8 > len) { res[name] = null; pos += 8; continue; }
 
 			let oh = struct.unpack('<II', substr(buf, pos, 8));
 			pos += 8;
+			note_ref(oh[0], oh[1]);
 			res[name] = (oh[1] > 0 && oh[0] + oh[1] <= len)
 				? utf16le_decode(substr(buf, oh[0], oh[1])) : null;
 		}
@@ -495,6 +558,7 @@ export function decode_info(fields, buf)
 
 			let oh = struct.unpack('<II', substr(buf, pos, 8));
 			pos += 8;
+			note_ref(oh[0], oh[1]);
 			let out = [];
 			let esz = (fmt == 'ipv4-array') ? 4 : 16;
 
@@ -514,6 +578,9 @@ export function decode_info(fields, buf)
 			pos += 4;
 
 			let count = +(res[fmt.array] ?? 0);
+
+			if (o > 0)
+				note_ref(o, count);
 			let out = [];
 
 			// hard bound: `count` comes straight off the modem wire; a
@@ -750,6 +817,24 @@ const SERVICE_NAMES = {
 	'6427015f-579d-48f5-8c54-f43ed1e76f83': 'qdu',
 	'8d8b9eba-37be-449b-8f1e-61cb034a702e': 'ms_voice_extensions',
 	'3e1e92cf-c53d-4f14-85d0-a86ad9e12245': 'google',
+};
+
+// The reverse: a service as a user names it — one of the names above, or a
+// UUID in its string form — as the UUID, or null for neither. For the raw
+// command path (ubus modem_mbim_raw), where a typo must be refused rather
+// than sent as a UUID of garbage.
+export function service_uuid(s)
+{
+	s = lc(s ?? '');
+
+	if (match(s, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/))
+		return s;
+
+	for (let uuid, name in SERVICE_NAMES)
+		if (name == s)
+			return uuid;
+
+	return null;
 };
 
 // Short name for a service UUID, or the UUID itself when it is not one of ours

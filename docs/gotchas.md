@@ -272,9 +272,19 @@ made here:
   session when the command *form* was wrong rather than the command absent
   (ddimension/wwand#12). Any success resets the count.
 - `+CME ERROR: <n>` is a runtime condition (SIM not ready, no network) and a
-  timeout means the port is wedged. Neither says the firmware lacks the command,
-  and a bare ERROR on either side of one is **not** a streak — counting through
-  them would retire on evidence that is not about the firmware at all.
+  timeout may mean the port is wedged. Neither says the firmware lacks the
+  command, and a bare ERROR on either side of one is **not** a streak — counting
+  through them would retire on evidence that is not about the firmware at all.
+
+Timeouts have their own, slower count. **Five timeouts of one command** retire
+it too (`AT_RETIRE_SILENT_AFTER`), but a timeout only counts when the port
+answered some *other* command since that one last went silent — an RG520N-EB
+behind an MHI DUN bridge never answered `AT+QENG="servingcell"` while `AT+CSQ`
+answered on the same port (ddimension/wwand#56). A separate telemetry port
+(`at2`) that answers **nothing** for 20 consecutive commands
+(`AT_PORT_DEAD_AFTER`) is closed instead, and telemetry falls back to the
+control channel (ddimension/wwand#60); both are re-probed on the next modem
+init.
 
 The memory is cleared with the AT channel (`close_at`), so a re-open after a
 protocol switch or a re-enumeration probes again from scratch.
@@ -287,9 +297,12 @@ With `lock_persist` the lock is in modem NV and survives reboots and `AT+CFUN`
 resets too: the config says "no lock", the hardware says "locked", and there is
 no way to say otherwise short of AT by hand.
 
-`config_check` now asks the modem and releases a lock the config does not
-request, followed by `save_ctrl` because the lock being cleared may have been
-persisted by an *earlier* config.
+`cell_lock.sync` asks the modem and releases a lock the config does not
+request, in whichever dialect the modem answers (`cell_lock.uc` `DIALECTS`,
+QMI included); on the Quectel AT dialect a release is followed by `save_ctrl`
+because the lock being cleared may have been persisted by an *earlier* config.
+A QMI modem runs it from `config_check`; MBIM and NCM reach it through
+`modem_common.run_at_init`.
 
 *Evidence:* HW-found on an NR7101 pinned to EARFCN 1300 / PCI 246, a cell not
 receivable at that site — permanent `"servingcell","SEARCH"`, `+CGATT: 0`,
@@ -308,6 +321,13 @@ plug-ins RETURN their implementation instead of registering it.
 **Wrong on the OpenWrt parser.** It must end with `};` — the newer host-built
 ucode is lenient, so `run_tests.sh` does NOT catch this. Sanity-import changed
 modules on the target after deploying.
+
+### `n == ''` tells an empty string from everything else
+**Not for `0`.** ucode compares loosely, as JS does: `0 == ''` is true, so a
+loop that skips empty names with `if (n == '') continue;` also skips the
+integer 0. It dropped a BG96's NONE slots from its RAT acquisition order
+(`[0,0,4,8]` went out as `[4,8]`, nas.uc `rat_order_ids`, HW-seen 2026-10-30).
+Test the type when a value may be a number: `type(n) == 'string' && n == ''`.
 
 ### Self-referencing arrow functions work like in JS
 **Wrong.** No hoisting: a `let` arrow that references itself (recursion,
@@ -453,8 +473,15 @@ to traverse `/`: ubus clients cannot reach the socket, rpcd and the web interfac
 die, and `ubus list` answers "Failed to connect to ubus" while `pgrep ubusd`
 shows it alive and sleeping with 30 open fds. Done on the Chateau, 2026-08-31.
 
-Name the subtrees instead of `.` (`tar cf - -C $ST ./usr ./etc ./www`), or pass
-`--owner=root --group=root`, or extract somewhere that is not `/`. Afterwards,
+**Naming the subtrees instead of `.` is NOT enough.** The entries `usr`, `etc`,
+`lib`, `etc/init.d` carry their staging owner and mode the same way, and busybox
+`tar` run as root applies them to the device's own directories: hwtest's
+`stage.sh` did exactly that, and every test device ended up with `/usr`, `/etc`
+and `/lib` owned by the developer's uid and mode 0775 (found 2026-10-30; a LuCI
+deploy of `-C root usr` did the same that day). Pass `--owner=0 --group=0
+--numeric-owner` AND strip group/other write from the staging tree (`chmod -R
+go-w`), or extract somewhere that is not `/`; hwtest's `stage.sh` now checks its
+own archive for both. Afterwards,
 `find / -xdev \( -uid <yours> -o -gid <yours> \)` finds what was mis-owned; the
 same trap applies to every earlier `-C <dir>` deploy in this repo's instructions,
 which is why `/usr/share/ucode/wwand` had been owned by a foreign uid for weeks
@@ -482,6 +509,26 @@ Arcadyan AW1000 (IPQ807x, RG500Q-EA), 2026-09-03.
 So "rmnet_nss is loaded, the children are adopted, the link is up" is not the
 same as "the datapath is offloaded", and the difference costs throughput
 silently. Check the NSS side before concluding wwand is the problem.
+
+### A vendor QMAP child is found by its name, or else by the parent's MAC
+**Neither survives a wwand restart.** `qmi_wwan_q` names its children
+`<parent>_<n>`, and wwand renames them to the context's `wwandN` on the first
+start, so the second start finds no `_1` under any stem. The probe declined
+there, `auto` fell through to a datapath that cannot serve that parent, and
+every retry ended in `mux_backend_unavailable` (ddimension/wwand#78, AW1000 +
+RG500Q-EA, 2026-11-04). The MAC was the fallback and is not an identity either:
+stock Quectel copies the parent's address onto each child, while the XT-Martinez
+variant adds the channel to the last octet (qmi_wwan_q.c:1375-1378), so an exact
+compare refused the real child.
+
+What does survive is the parent link. The driver registers each child with
+`SET_NETDEV_DEV(qmap_net, &real_dev->dev)` (qmi_wwan_q.c:1361; `pcie_mhi`
+does the same, mhi_netdev_quectel.c:1615), so `/sys/class/net/<child>/device`
+points at the parent netdev, and kernfs builds that link from the current names
+on every read (fs/kernfs/symlink.c:56-125, 6.18.41): it follows either rename.
+Mainline rmnet and qmimux children set no parent, so the link is also what tells
+the two apart. The MAC stays as the fallback when no link can be read, compared
+on its first five octets.
 
 ### Upgrading luci-app-wwand makes browsers fetch the new JS
 **No. The cache-busting token is luci-base's version, not the app's.** `luci.js`
@@ -614,7 +661,7 @@ status page drew signal only from `lte.rsrp` / `nr5g.rsrp` and otherwise printed
 at once (sponsor box, 2026-09-10).
 
 The generic `rssi` is the common floor and for some modems it is all there is:
-the FM350-GL on NCM, the EG06 on native MBIM (`telemetry_mbim.uc:59`) and any
+the FM350-GL on NCM, the EG06 on native MBIM (`telemetry_mbim.uc:63`) and any
 QMI modem camped on 2G/3G report it alone. Two of the three modems on that one
 box hit the dead end, on two different backends. Registration is what the
 registration block says (`fmt.regShort`); the absence of a measurement is not
@@ -723,6 +770,44 @@ around:
   `head -c 20 /usr/share/ucode/wwand/<any>.uc`. `// SPDX` = source, safe to
   patch file-by-file. `#!/usr/bin/env ucode` = bytecode: test the change there
   through a package build, not a file drop.
+
+## An MBIM modem answers a command it does not support
+**Not every one: a Huawei ME906s IGNORES a command for a service it does not
+list.** Firmware 11.617.00.00.11 (ZyXEL LTE3301, 2026-11-17) lists eleven
+services in `DEVICE_SERVICES` — neither MS Basic Connect Extensions nor the QMI
+passthrough among them — and sent nothing back, no status, no function error,
+to the MBIMEx version query, a passthrough `GET_VERSION_INFO` and the LTE attach
+configuration. Each sat until its timeout: 10 + 15 + 25 s of every bring-up, and
+every timeout a vote on the recovery ladder against a channel that worked. The
+RM520N-GL did the same to an unlisted vendor service (atcmd_mbim.uc `attach`),
+so it is not one firmware's oddity. The list is mandatory Basic Connect and
+every device answers it; `mbim_client` reads it after OPEN and refuses an
+unlisted command locally (`refuse_unlisted`).
+
+## A QMI modem with a UIM service has logical channels, and an AT port has `CCHO`
+**Not the Huawei E392** (firmware 11.433.59.00.192, Chateau, 2026-11-19). Its
+UIM service sends APDUs (`SEND_APDU` 0x3B) but has no channel message:
+`LOGICAL_CHANNEL` 0x3F answers `InvalidArgument` for any AID,
+`OPEN_LOGICAL_CHANNEL` 0x42 and Get Supported Messages 0x1E `InvalidQmiCommand`.
+Its AT port has `CRSM` and nothing else for the card — no `CSIM`, `CCHO`,
+`CGLA`. The APDU probe saw an AT port and chose `at` (its probe is "is there a
+port", because an AT open on a plain SIM cannot be told from a modem without
+the command), and every channel open then failed, so IMS-AKA never ran. The
+card itself does channels: MANAGE CHANNEL through `SEND_APDU` returns one, and
+the modem passes a CLA with the channel number untouched (CLA 01 without the
+QMI channel TLV, and CLA 00 with it). That is the `qmi_apdu` transport in
+`sim.uc`; a real open that AT refuses on a port that never opened a channel
+falls back to it.
+
+## A modem switched into its MBIM USB configuration answers MBIM
+**Not the ME906s when it goes there straight from its ECM configuration.** The
+kernel picks configuration 2 (CDC-ECM) at enumeration; `echo 3 >
+bConfigurationValue` binds cdc_mbim, and the first such switch after power-up
+left the function mute — mbimcli's MBIM_OPEN went unanswered as well, so not a
+wwand defect. Going through the unconfigured state, `echo 0` then `echo 3`,
+answered at once, at boot as well as later, in five of five boots (LTE3301,
+2026-11-17). The test box does that in a local hotplug script; wwand does not
+choose USB configurations.
 
 ## One MBIM message, two encodings — and a firmware may pick the wrong one
 
@@ -896,6 +981,25 @@ sending to that service until it answers again.
 *Evidence:* ddimension/wwand#61 (RG520N-EB on an IPQ5018, frozen after 7–8 h,
 SIGTERM ignored, a restarted daemon stuck in INIT_SERVICES until a modem reset).
 
+## An acknowledged QMI reset is a reset
+
+**Wrong.** DMS resets only from offline, so every QMI reset in the tree is
+offline → reset — and an EG25-G (EG25GGBR07A08M2G) answered the reset with
+success and did not perform it, any number of times, over QMI and over AT
+(`AT+CFUN=1,1` OK, no re-enumeration). It was left offline, and from offline it
+refused every other mode with INVALID_TRANSITION (60): online, low power,
+persistent low power, factory test; `AT+CFUN=0/1/4` gave CME ERROR 4, CFUN read
+7. The ladder made it worse — its opmode cycle is refused the same way, its
+reset is the one that does not happen, and the reboot at its end did not cut
+the modem's USB power on that box. wwand now checks after a reset that the
+modem left the bus or is no longer offline, and a bring-up that finds it
+offline resets it and, if it stays, says *stuck offline* instead of climbing
+(`modem_init_qmi.uc reset_out_of_offline`, `modem.uc watch_reset`).
+
+*Evidence:* HW, RPi4 + EG25-G, 2026-11-07: DMS SET_OPERATING_MODE from 3 →
+0/1/2/6 answered `0x0001/0x003c`, → 4 answered success, mode read back 3, no
+USB disconnect within 60 s; a Pi reboot and a hub-port disable left it offline.
+
 ## A called `(a ?? b.c)(…)` misplaces the stack
 
 Calling a parenthesized `??` whose right operand is a member expression
@@ -922,3 +1026,20 @@ Write it as two statements (`let mk = a ?? b.c; mk(w);`), as transport.uc
 already did. `tools/check-ucode-pitfalls.py` fails on every called
 parenthesized `??` that is not a `return` / arrow body, and runs in
 `run_tests.sh`.
+
+## An MBIM modem's PACKET_STATISTICS counts the traffic
+**Not the ME906s: every counter is zero while its netdev moves data**
+(11.617.00.00.11, 2026-11-18). The MBIM zero-rx watchdog read only that
+answer, so it saw a frozen 0 and would have reset the modem once
+`zero_rx_timeout` (6 h) ran out; `wwandctl` showed "down 0 bytes". The MBIM
+context now does what the QMI monitor does for QMAP-offloaded modems: an rx of
+zero sends it to the kernel's counters, and whichever source first shows a
+packet is kept for the connection (`context_mbim.uc sample_stats`).
+
+## A v1 MBIM answer is shorter than the v2 one
+**Not when it carries strings.** MBIMEx v2 APPENDS `PreferredDataClasses` to
+REGISTER_STATE, and a decoder that reads the field whenever the buffer is long
+enough reads a v1 answer's DataBuffer there: an ME906s (no MBIMEx) gave
+0x00360032 — UTF-16 "2", "6", the start of its provider id "26202". The fixed
+part ends where the lowest referenced offset begins, and `codec/mbim.uc
+decode_info` now reads every field past that point as absent.

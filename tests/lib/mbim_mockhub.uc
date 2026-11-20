@@ -72,6 +72,12 @@ export function create(opts)
 		// which is a device declining the handshake with a proper answer: the
 		// first is recoverable by closing and reopening, the second is not.
 		mbimex_function_errors: opts?.mbimex_function_errors ?? 0,
+		// the service UUIDs DEVICE_SERVICES lists; null answers it with a
+		// failure (the list stays unknown, mbim_client gates nothing)
+		device_services: opts?.device_services ?? null,
+		// commands no configured schema knows, as { uuid, cid }: what a
+		// test asserts was NOT sent to an unlisted service
+		unknown_calls: [],
 		// the last event subscription the client sent, decoded
 		subscribed: null,
 		// set only once a VERSION query has actually been answered
@@ -139,6 +145,29 @@ export function create(opts)
 
 		let entry = by_key[route_key(uuid, cid)];
 
+		// BUILT-IN: DEVICE_SERVICES (basic_connect cid 16), when the test says
+		// what the function offers — the MBIM_DEVICE_SERVICES_INFO layout
+		// with an empty CID list per element
+		if (!entry && cid == 16 && hexenc(uuid) == 'a289cc33bcbb8b4fb6b0133ec2aae6df' && self.device_services != null) {
+			let n = length(self.device_services);
+			let refs = '', elems = '';
+
+			for (let u in self.device_services) {
+				refs += struct.pack('<II', 8 + n * 8 + length(elems), 28);
+				elems += mbim.uuid_bytes(u) + struct.pack('<III', 0, 0, 0);
+			}
+
+			let info = struct.pack('<II', n, 0) + refs + elems;
+			let body = struct.pack('<II', 1, 0) + uuid + struct.pack('<III', cid, 0, length(info)) + info;
+
+			push(self.calls, { name: 'DEVICE_SERVICES', cid: cid, kind: 'query' });
+			deliver(struct.pack('<III', mbim.MSG_COMMAND_DONE, 12 + length(body), txn) + body);
+			return true;
+		}
+
+		if (!entry)
+			push(self.unknown_calls, { uuid: hexenc(uuid), cid: cid });
+
 		// a service/cid no configured schema knows (e.g. the QMI-passthrough
 		// probe): answer with a non-zero MBIM status so the caller sees a clean
 		// failure instead of the test aborting.
@@ -204,6 +233,18 @@ export function create(opts)
 
 			handler = { __raw: struct.pack('<HH', 0x0100, self.mbimex_version) };
 		}
+
+		// BUILT-IN: the PIN List, which the SIM step asks after an unlocked
+		// PIN (modem_mbim.uc pin1_from_list) to learn whether the PIN query
+		// is on — answered "PIN1 disabled", the ME906s' answer (2026-11-19).
+		// A test that cares overrides it.
+		if (handler == null && entry.name == 'PIN_LIST')
+			handler = { pin1_mode: 2, pin1_format: 1, pin1_min: 4, pin1_max: 8 };
+
+		// ...and the PIN query that goes with it (mbim_pin.status), for the
+		// tests that never reach a SIM step of their own: unlocked, 3 left
+		if (handler == null && entry.name == 'PIN' && kind == 'query')
+			handler = { pin_type: 0, pin_state: 0, remaining_attempts: 3 };
 
 		if (handler == null)
 			die(sprintf('mbim_mockhub: no handler for %s', entry.name));
